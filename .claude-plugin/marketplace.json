@@ -1,0 +1,15 @@
+{
+  "name": "tuix",
+  "description": "Tuix feedback in Claude Code.",
+  "owner": {
+    "name": "Tuix"
+  },
+  "plugins": [
+    {
+      "name": "tuix",
+      "source": "./",
+      "description": "A pane of a project's Tuix issues, and /tuix to hand one to Claude to fix. The code is the hooks module hooks/register.tsx.",
+      "commands": ["./commands/tuix-list.md"]
+    }
+  ]
+}

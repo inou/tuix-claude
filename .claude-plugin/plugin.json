@@ -1,0 +1,23 @@
+{
+  "name": "tuix",
+  "version": "0.2.0",
+  "description": "Tuix feedback in Claude Code: a pane of a project's issues, and /tuix to hand one to Claude to fix.",
+  "author": {
+    "name": "Tuix"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "server": {
+      "type": "string",
+      "title": "Tuix MCP server",
+      "description": "The name of the Tuix MCP server as /mcp lists it. Leave empty to find it by name.",
+      "default": ""
+    },
+    "project": {
+      "type": "string",
+      "title": "Tuix project",
+      "description": "The project ID or name to show. Leave empty to pick one in the pane.",
+      "default": ""
+    }
+  }
+}
