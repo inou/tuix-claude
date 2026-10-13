@@ -1,8 +1,10 @@
 import type { TuixBox, TuixPoint, TuixSize } from '../types'
+import { MUTED, PEACH, round } from './look'
+import type { Picture } from './look'
 
 // A report gives numbers only: no string of a report reaches this drawing.
-
-export type Locator = { source: string; alt: string; width: number; height: number }
+// The colours are the Tuix ones (Evening Light, hooks/look.ts). The drawing holds the light palette, the dark
+// one under prefers-color-scheme, and the light colours again on each shape, for a surface that drops the <style>.
 
 export type LocatorInput = { box: TuixBox | null; viewport: TuixSize | null; scroll: TuixPoint | null }
 
@@ -14,16 +16,17 @@ const PAD = 8
 const ROOM_WIDTH = 212
 const ROOM_HEIGHT = 168
 const BAR_WIDTH = 6
+// The window and its scroll bar in muted lavender, and the element in peach, which is one colour in both
+// schemes. So only the lavender has a rule for the dark scheme.
+const LINE = ['#8b83ab', '#7b70a8'] as const
+const STYLE =
+  `<style>.w{fill:${MUTED[0]};stroke:${LINE[0]}}.t{fill:${MUTED[0]}}` +
+  `@media (prefers-color-scheme:dark){.w{fill:${MUTED[1]};stroke:${LINE[1]}}.t{fill:${MUTED[1]}}}</style>`
 // No page is larger than this; the cap keeps a wild number from making a huge drawing.
 const LIMIT = 1_000_000
 
 function finite(value: number): boolean {
   return Number.isFinite(value) && Math.abs(value) <= LIMIT
-}
-
-// One decimal is enough for a drawing of 240 pixels.
-function round(value: number): number {
-  return Math.round(value * 10) / 10
 }
 
 function clamp(value: number, low: number, high: number): number {
@@ -81,7 +84,7 @@ export function locatorText(input: LocatorInput): string | undefined {
  * centre and a bar for the scroll position. It holds no text, so it holds no
  * string of a report. It is undefined when the box or the window is missing.
  */
-export function locatorSvg(input: LocatorInput): Locator | undefined {
+export function locatorSvg(input: LocatorInput): Picture | undefined {
   const shape = drawable(input)
 
   if (shape === undefined) {
@@ -115,17 +118,17 @@ export function locatorSvg(input: LocatorInput): Locator | undefined {
   const barLeft = WIDTH - PAD - BAR_WIDTH
 
   const shapes = [
-    `<rect x="${round(left)}" y="${PAD}" width="${round(width)}" height="${round(height)}" rx="2" fill="#94a3b8" fill-opacity="0.12" stroke="#94a3b8"/>`,
+    `<rect class="w" x="${round(left)}" y="${PAD}" width="${round(width)}" height="${round(height)}" rx="2" fill="${MUTED[0]}" fill-opacity="0.1" stroke="${LINE[0]}"/>`,
     isShown
-      ? `<rect x="${round(left + x1 * scale)}" y="${round(PAD + y1 * scale)}" width="${round(Math.max(3, (x2 - x1) * scale))}" height="${round(Math.max(3, (y2 - y1) * scale))}" fill="#dc2626" fill-opacity="0.28" stroke="#dc2626"/>`
+      ? `<rect x="${round(left + x1 * scale)}" y="${round(PAD + y1 * scale)}" width="${round(Math.max(3, (x2 - x1) * scale))}" height="${round(Math.max(3, (y2 - y1) * scale))}" fill="${PEACH}" fill-opacity="0.28" stroke="${PEACH}"/>`
       : '',
-    `<circle cx="${round(left + centreX * scale)}" cy="${round(PAD + centreY * scale)}" r="3.5" fill="${isShown ? '#dc2626' : 'none'}" stroke="#dc2626" stroke-width="1.5"/>`,
-    `<rect x="${barLeft}" y="${PAD}" width="${BAR_WIDTH}" height="${round(track)}" rx="3" fill="#94a3b8" fill-opacity="0.3"/>`,
-    `<rect x="${barLeft}" y="${round(thumbTop)}" width="${BAR_WIDTH}" height="${round(thumb)}" rx="3" fill="#64748b"/>`,
+    `<circle cx="${round(left + centreX * scale)}" cy="${round(PAD + centreY * scale)}" r="3.5" fill="${isShown ? PEACH : 'none'}" stroke="${PEACH}" stroke-width="1.5"/>`,
+    `<rect class="t" x="${barLeft}" y="${PAD}" width="${BAR_WIDTH}" height="${round(track)}" rx="3" fill="${MUTED[0]}" fill-opacity="0.25"/>`,
+    `<rect class="t" x="${barLeft}" y="${round(thumbTop)}" width="${BAR_WIDTH}" height="${round(thumb)}" rx="3" fill="${MUTED[0]}" fill-opacity="0.7"/>`,
   ]
   const source =
     `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${total}" viewBox="0 0 ${WIDTH} ${total}">` +
-    `${shapes.join('')}</svg>`
+    `${STYLE}${shapes.join('')}</svg>`
 
   return { source, alt: LOCATOR_ALT, width: WIDTH, height: total }
 }

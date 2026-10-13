@@ -141,7 +141,8 @@ Read the file `hooks/register.tsx` before you install.
 - **`/tuix list`** writes the issues in the transcript. Use it where no pane shows, for example in the VS Code extension or `claude -p`.
 - **`/tuix doctor`** writes a report in the transcript. It shows what Claude Code says about the mod's access to Tuix. See [Permissions](#permissions). The command makes no call to Tuix.
 - **`/tuix:tuix-list`** is a command in a Markdown file. It asks Claude to list the open issues of a project with the `list_projects` and `list_issues` tools of the Tuix connector. Add a project name to choose a project, for example `/tuix:tuix-list Checkout`. The command tells Claude that the result is data and not instructions. It runs no hook. See [If your organization blocks mods](#if-your-organization-blocks-mods).
-- **In the Desktop app**, the pane draws each issue as a card with type and severity badges. It has dropdowns for the project and the status. Each card has **Details** and **Fix with Claude**.
+- **In the Desktop app**, the pane draws the tuix wordmark and each issue as a card in the look of Tuix: a status chip, the number with the type and severity, the title, and the route. It has dropdowns for the project and the status. The title opens the report, and each card has **Fix with Claude**. The border of a card turns peach under the pointer. Below Claude Code 2.1.295 the title is plain text and the card has a **Details** button.
+- **In the Desktop app**, the report shows a small copy of its screenshot. The mod makes the copy on your computer: it reads the PNG with the `get_screenshot` tool, shrinks it to 800 pixels wide at most, and draws it as a JPEG. It reads no picture over 3200 pixels a side, and gives up on one that takes more than 2 seconds. The peach frame round the element is in the screenshot. A rule for `get_screenshot` lets the mod read it when the report opens. Without a rule, the report has a **Show screenshot** button, and Claude Code asks you when you press it. Until the copy is ready, the report shows a drawing of where the element was. **Open screenshot** under the picture opens the full-size file. When the mod cannot make the copy, the report says why and keeps the drawing. The terminal keeps its text.
 - **In the Desktop app**, a call of Claude to the Tuix `list_issues` or `get_issue` tool shows issue cards in its result row. The row does not show the raw JSON. Rows of other tools, and every row in the terminal, stay as Claude Code draws them.
 - **Load more** in the pane reads the next page of issues. The pane reads one page, then one more page for each press, up to four pages. Where a rule lets the mod read without a question, the pane reads up to four pages at once. It reads the blocking issues first. The pane hides **Load more** while the list loads.
 - The pane shows a chip, for example `reads: allowed by rule mcp__claude_ai_Tuix__list_*` or `reads: will ask`. Select the chip to open the Diagnostics box.
@@ -161,7 +162,7 @@ Run `claude plugin validate .claude-plugin/plugin.json` in the folder that holds
 
 | Call | What the mod does with it |
 | --- | --- |
-| `$.mcp.call` | Reads `list_projects` and `list_issues` from the Tuix server. It calls no other tool. |
+| `$.mcp.call` | Reads `list_projects`, `list_issues`, `get_issue` and `get_screenshot` from the Tuix server. It calls no other tool. |
 | `$.tool.list` | Lists the tools of the session to find the Tuix server. |
 | `$.tool.check` | Asks Claude Code if a read tool needs a question. It cannot approve a call. |
 | `$.prompt.submit` | Asks Claude to fix an issue. It runs only when you press **Fix with Claude** or run `/tuix fix`. |
@@ -200,6 +201,7 @@ The mod has no `tool.check` hook. It cannot approve a call for you.
 | Issue cards in the transcript of the Desktop app. Below this release the transcript shows the raw result. | 2.1.289 |
 | Actions that change an issue. The mod has none yet. | 2.1.292 |
 | One-step install with `claude plugin install tuix --marketplace` | 2.1.292 |
+| The title of an issue card in the Desktop pane opens the report. Below this release the card has a **Details** button. | 2.1.295 |
 
 The mod reads the release while the session starts, and turns off the features that the release does not have. The command `/tuix:tuix-list` is a Markdown file. It does not need support for mods.
 
@@ -209,7 +211,7 @@ To see your release, run `claude --version` in a terminal. In any session, run `
 
 Claude Code checks each call that the mod makes to Tuix, as it checks each call that Claude makes. If no rule allows a call, Claude Code asks you. The mod never changes your rules. It never answers a question for you.
 
-The mod makes no call to Tuix until you run `/tuix` or press a button. There is one exception. At the start of a session, the mod reads Tuix when a rule already allows `list_projects` and `list_issues`.
+The mod makes no call to Tuix until you run `/tuix` or press a button. There are two exceptions. At the start of a session, the mod reads Tuix when a rule already allows `list_projects` and `list_issues`. When you open a report in the Desktop app, the mod reads the screenshot if a rule allows `get_screenshot`. Without that rule, a **Show screenshot** button asks first.
 
 ### Allow the reads
 
@@ -328,10 +330,32 @@ The tests use a fake Tuix server. They need no network and no credentials. CI ru
 | `commands/tuix-list.md` | The `/tuix:tuix-list` command |
 | `hooks/hooks.json` | Names the hooks module, `register.tsx` |
 | `hooks/register.tsx` | The hooks: the `/tuix` command and the pane |
-| `hooks/tuix.ts` | Functions with no engine calls: parse the MCP results, make the fix prompt |
+| `hooks/tuix.ts` | Functions with no engine calls: parse the MCP results, make the fix prompt, draw the pictures |
+| `hooks/locator.ts` | The drawing of where the element was in the browser window |
+| `hooks/look.ts` | What the pictures share: the Tuix colours, the type of a drawing, the rounding |
+| `hooks/thumbnail.ts` | Makes the small copy of a screenshot: reads a PNG or JPEG, shrinks it, writes a JPEG |
+| `hooks/vendor/` | Copies of fflate (inflate) and jpeg-js (JPEG encoder and decoder), with their licences. See [Third-party code](#third-party-code). |
 | `types/index.d.ts` | The types of the values the pane keeps in `$.state` |
-| `tests/tuix.test.ts` | The tests |
+| `tests/tuix.test.ts` | The tests of the pane and the helpers |
+| `tests/thumbnail.test.ts` | The tests of the small copy: the PNG reader, the size limits, the refusals |
+| `tests/png.ts`, `tests/fixtures/` | A PNG writer for the tests, and small screenshots that Chromium drew |
 
 The version of the mod is in `.claude-plugin/plugin.json` only. A test holds `VERSION` in `hooks/tuix.ts` equal to it.
 
 When the engine loads the mod from a folder that it watches, it writes the API types to `.claude-plugin/types/`. Git ignores that folder.
+
+## Third-party code
+
+The small copy of a screenshot needs an inflate, a JPEG decoder and a JPEG encoder. A mod has none, so the folder `hooks/vendor/` holds copies of small libraries. Each file keeps the licence header of its library and lists its changes.
+
+| File | Library | Licence | Source |
+| --- | --- | --- | --- |
+| `hooks/vendor/inflate.ts` | fflate 0.8.3, the inflate part | MIT | https://github.com/101arrowz/fflate |
+| `hooks/vendor/jpeg-encoder.ts` | jpeg-js 0.4.4, `encoder.js` | BSD-3-Clause | https://github.com/jpeg-js/jpeg-js |
+| `hooks/vendor/jpeg-decoder.ts` | jpeg-js 0.4.4, `decoder.js` | Apache-2.0 | https://github.com/jpeg-js/jpeg-js |
+
+`hooks/vendor/THIRD_PARTY.md` has the licence texts and the list of changes.
+
+## Publish
+
+The files in `inou/tuix-claude` are a copy of the folder `packages/claude-code` in the Tuix source. Each release replaces them. Do not change them in `inou/tuix-claude`: the next release removes the change.

@@ -1,6 +1,6 @@
 {
   "name": "tuix",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tuix feedback in Claude Code: a pane of a project's issues, and /tuix to hand one to Claude to fix.",
   "author": {
     "name": "Tuix"

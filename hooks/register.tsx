@@ -12,10 +12,15 @@ import type {
   TuixLoad,
   TuixProject,
   TuixReport,
+  TuixScreenshot,
   TuixShotLink,
+  TuixThumb,
   TuixVerdict,
 } from '../types'
 import { locatorSvg, locatorText } from './locator'
+import { PEACH } from './look'
+import type { Picture } from './look'
+import { makeThumbnail } from './thumbnail'
 import {
   DATA_LABEL,
   DIAGNOSTICS_HINT,
@@ -30,6 +35,7 @@ import {
   READ_TOOLS,
   REPORT_SECTIONS,
   SCOPE_HINT,
+  SCREENSHOT_ALT,
   SHOT_FRESH_MS,
   STATUS_LABEL,
   TEXT_ONLY_HINT,
@@ -40,7 +46,6 @@ import {
   activityLine,
   age,
   appLink,
-  badgeSvg,
   chipText,
   commentHead,
   consoleSource,
@@ -56,11 +61,15 @@ import {
   isTextOnlyRefusal,
   isTuixToolName,
   issueLine,
+  issueSeverityOf,
+  issueTypeOf,
   issuesOf,
   matchProject,
   mcpServersOf,
   mergeIssues,
+  metaSvg,
   needsReport,
+  needsThumb,
   networkSource,
   nextCommentsCursor,
   nextCursor,
@@ -71,18 +80,24 @@ import {
   parseIssues,
   parseProjects,
   payloadOf,
+  pictureShot,
   problemOfError,
   readRules,
   refusingRules,
   releaseOf,
   remember,
+  rememberThumb,
   screenshotLink,
+  screenshotOf,
+  screenshotSvg,
   screenshotUrls,
+  sectionLabelSvg,
   serverKey,
   setupGuide,
   shotText,
   sourceOf,
   sourceWarning,
+  statusChipSvg,
   toolName,
   toolPayload,
   toolsOf,
@@ -90,8 +105,9 @@ import {
   tuixToolKind,
   uniqueServers,
   whereLines,
+  wordmarkDotSvg,
 } from './tuix'
-import type { DoctorFacts, SetupGuide, ToolName } from './tuix'
+import type { DoctorFacts, MetaInput, SectionLabel, SetupGuide, ToolName } from './tuix'
 
 type Engine = EngineInterface
 type DesktopElements = Elements['desktop']
@@ -126,6 +142,8 @@ const selected = atom({ plugin: 'tuix', key: 'selected' } as const, null)
 // The full reports read in this session, by issue ID, and the fresh screenshot links, by screenshot ID.
 const reports = atom({ plugin: 'tuix', key: 'reports' } as const, {})
 const shots = atom({ plugin: 'tuix', key: 'shots' } as const, {})
+// The small copies of screenshots the mod made, by screenshot ID: at most four are ready.
+const thumbs = atom({ plugin: 'tuix', key: 'thumbs' } as const, {})
 const load = atom({ plugin: 'tuix', key: 'load' } as const, { phase: 'idle' })
 // The Tuix servers tool.describe named: it sees the tools held back for
 // ToolSearch too, which the tool list may leave out.
@@ -701,7 +719,7 @@ async function patchReport($: Engine, id: string, change: (report: TuixReport) =
   })
 }
 
-async function loadReport($: Engine, id: string, run: number): Promise<void> {
+async function loadReport($: Engine, id: string, run: number, isForced: boolean): Promise<void> {
   const key = `report:${id}`
 
   try {
@@ -713,7 +731,15 @@ async function loadReport($: Engine, id: string, run: number): Promise<void> {
     const report = await readReport($, await activeServer($), id)
 
     if (isLatest(key, run)) {
-      await update($, reports, all => remember(all, id, report, MAX_REPORTS))
+      // The copy of the screenshot starts before the report shows, so that the view never flashes a button.
+      if (report.detail !== undefined) {
+        await autoThumb($, id, report.detail, isForced).catch(() => undefined)
+      }
+
+      // A newer read may have taken over while the copy started, and the older one must not overwrite it.
+      if (isLatest(key, run)) {
+        await update($, reports, all => remember(all, id, report, MAX_REPORTS))
+      }
     }
   } catch (error) {
     if (isLatest(key, run)) {
@@ -769,13 +795,20 @@ async function startReport($: Engine, issue: TuixIssue, isForced: boolean): Prom
   const loading: TuixReport = { phase: 'loading', ...(report?.detail === undefined ? {} : { detail: report.detail }) }
 
   await update($, reports, all => remember(all, issue.id, loading, MAX_REPORTS))
-  $.clock.after(1, () => loadReport($, issue.id, run))
+  $.clock.after(1, () => loadReport($, issue.id, run, isForced))
 }
 
 async function showIssue($: Engine, issue: TuixIssue): Promise<void> {
   await update($, selected, () => issue.id)
   await update($, note, () => null)
   await startReport($, issue, false)
+
+  // A report that is already read may have lost its copy of the screenshot, or never had one.
+  const detail = (await read($, reports))[issue.id]?.detail
+
+  if (detail !== undefined) {
+    await autoThumb($, issue.id, detail, false).catch(() => undefined)
+  }
 }
 
 async function loadComments($: Engine, id: string, cursor: string, run: number): Promise<void> {
@@ -897,6 +930,89 @@ async function openShot($: Engine, issueId: string, shotId: string): Promise<voi
   $.clock.after(1, () => loadShot($, issueId, shotId, run))
 }
 
+// Starts the read of the small copy of a screenshot. The read runs on a timer, so that a permission dialog
+// does not hold the press. A copy that is on screen stays until the new one is made.
+async function startThumb($: Engine, issueId: string, shotId: string): Promise<void> {
+  const run = startRun(`thumb:${shotId}`)
+  const loading: TuixThumb = { phase: 'loading' }
+
+  await update($, thumbs, all => (all[shotId]?.phase === 'ready' ? all : rememberThumb(all, shotId, loading)))
+  $.clock.after(1, () => loadThumb($, issueId, shotId, run))
+}
+
+// Starts the copy of the screenshot of a report on its own, when a rule lets the mod read it without a
+// question. Only the Desktop app draws it. A screenshot has one read in a session, and a forced read
+// (Reload) makes another. A read that died stays as it is, and the Show screenshot button reads it again.
+// Without a rule, the report view has a button, and the question comes with the press.
+async function autoThumb($: Engine, issueId: string, detail: TuixDetail, isForced: boolean): Promise<void> {
+  const shot = pictureShot(detail.context?.screenshots ?? null)
+
+  if (shot === undefined || !(await $.session.surfaces()).includes('desktop')) {
+    return
+  }
+
+  if (!needsThumb((await read($, thumbs))[shot.id], isForced)) {
+    return
+  }
+
+  const verdict = (await checkTools($, await activeServer($), ['get_screenshot'])).tools.get_screenshot
+
+  if (verdict?.decision === 'allow') {
+    await startThumb($, issueId, shot.id)
+  }
+}
+
+async function loadThumb($: Engine, issueId: string, shotId: string, run: number): Promise<void> {
+  const key = `thumb:${shotId}`
+
+  try {
+    if (!isLatest(key, run)) {
+      return
+    }
+
+    const image = screenshotOf(await $.mcp.call(await activeServer($), 'get_screenshot', { issue_id: issueId, screenshot_id: shotId }))
+    const made = makeThumbnail({ mediaType: image.mediaType, base64: image.data })
+
+    if ('error' in made) {
+      throw new TuixError(made.error)
+    }
+
+    const picture = screenshotSvg(made)
+
+    if (picture === undefined) {
+      throw new TuixError('The small copy of the screenshot is too large to draw.')
+    }
+
+    if (isLatest(key, run)) {
+      const ready: TuixThumb = { phase: 'ready', source: picture.source, width: picture.width, height: picture.height }
+
+      await update($, thumbs, all => rememberThumb(all, shotId, ready))
+    }
+  } catch (error) {
+    if (isLatest(key, run)) {
+      await failThumb($, shotId, error)
+    }
+  } finally {
+    endRun(key, run)
+  }
+}
+
+// A failed copy keeps the Setup state that fits the failure, as a failed report does.
+async function failThumb($: Engine, shotId: string, error: unknown): Promise<void> {
+  const message = oneLine(error instanceof Error ? error.message : String(error), 200)
+  const problem = problemOfError(error)
+  const name = await activeServer($)
+
+  if (problem === 'not-allowed' || problem === 'no-verdict') {
+    await checkReads($, name)
+  }
+
+  const failed: TuixThumb = { phase: 'error', message, server: name, ...(problem === undefined ? {} : { problem }) }
+
+  await update($, thumbs, all => rememberThumb(all, shotId, failed))
+  await update($, lastError, () => message)
+}
+
 // The prompt starts a turn of its own once the session is idle. A timer sends
 // it, because work a hook leaves running stops when the command or press ends.
 function startFix($: Engine, issue: TuixIssue): void {
@@ -945,28 +1061,61 @@ async function listText($: Engine): Promise<string> {
   ].join('\n')
 }
 
-// One issue as a card for the Desktop app: badges, title, facts, and the
-// buttons a caller gives. Report text goes in Text only, never in the SVG.
-function issueCard(el: DesktopElements, issue: TuixIssue, now: number, actions?: JSX.Element): JSX.Element {
-  const { Box, Svg, Text } = el
-  const badge = badgeSvg(issue)
+// What the meta picture takes of an issue: its number, and the type and severity when they are known words.
+function metaOf(issue: TuixIssue): MetaInput {
+  return { number: issue.number, type: issueTypeOf(issue.type), severity: issueSeverityOf(issue.severity) }
+}
+
+// A drawing as an Svg element.
+function pictureOf(Svg: DesktopElements['Svg'], one: Picture): JSX.Element {
+  return <Svg source={one.source} alt={one.alt} width={one.width} height={one.height} />
+}
+
+type CardOptions = {
+  // Makes the title the press that opens the report. Without it the title is only text.
+  open?: () => void
+  actions?: JSX.Element
+}
+
+// One issue as a card for the Desktop app: the status chip, the number, type and severity, the title as
+// the lead, the facts, and the actions a caller gives. Report text goes in Text only, never in the SVG.
+function issueCard(el: DesktopElements, issue: TuixIssue, now: number, options: CardOptions): JSX.Element {
+  const { Box, Button, Svg, Text } = el
+  const meta = metaSvg(metaOf(issue))
   const facts = [issue.route, issue.environment, issue.author === null ? null : `by ${issue.author}`]
+  const title = (
+    <Text bold wrap="wrap">
+      {issue.title}
+    </Text>
+  )
 
   return (
-    <Box key={`card-${issue.id}`} flexDirection="column" borderStyle="round" borderColor="subtle" paddingX={1}>
+    <Box
+      key={`card-${issue.id}`}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="subtle"
+      paddingX={1}
+      hover={{ borderColor: PEACH }}
+    >
       <Box flexDirection="row" columnGap={1} alignItems="center">
-        {badge !== undefined && <Svg source={badge.source} alt={badge.alt} width={badge.width} height={badge.height} />}
-        <Text dimColor>{`${issue.reference} · ${STATUS_LABEL[issue.status]} · ${age(issue.updatedAt, now)} ago`}</Text>
+        {pictureOf(Svg, statusChipSvg(issue.status))}
+        {meta !== undefined && pictureOf(Svg, meta)}
+        <Text dimColor>{`${age(issue.updatedAt, now)} ago`}</Text>
       </Box>
-      <Text bold wrap="wrap">
-        {issue.title}
-      </Text>
+      {options.open === undefined ? (
+        title
+      ) : (
+        <Button key={`issue-${issue.id}`} plain onPress={options.open}>
+          {title}
+        </Button>
+      )}
       {facts.some(Boolean) && (
         <Text dimColor wrap="truncate-end">
           {facts.filter(Boolean).join(' · ')}
         </Text>
       )}
-      {actions}
+      {options.actions}
     </Box>
   )
 }
@@ -1054,13 +1203,19 @@ function diagnosticsView($: Engine, el: CommonElements, facts: DoctorFacts, copi
   )
 }
 
-// The elements both panes draw a report with. The Desktop app adds Svg, for the badge and the locator.
+// The elements both panes draw a report with. The Desktop app adds Svg, for the chips, the headings and the locator.
 type DetailElements = Pick<Elements['terminal'], 'Box' | 'Button' | 'Code' | 'Link' | 'Text'>
+
+// The Svg element of the Desktop app, or undefined on the terminal, which draws the words as text.
+type MaybeSvg = DesktopElements['Svg'] | undefined
 
 type DetailParts = {
   issue: TuixIssue
   report: TuixReport | undefined
   links: Record<string, TuixShotLink>
+  // The small copies of the screenshots (the Desktop app draws them), and the Setup state of a failed one.
+  thumbs?: Record<string, TuixThumb>
+  thumbGuide?: SetupGuide
   now: number
   // The Setup state of a failed read, when one fits.
   guide: SetupGuide | undefined
@@ -1082,13 +1237,46 @@ async function reportGuide($: Engine, report: TuixReport | undefined, surface: R
   return guideOf($, { phase: 'error', problem: report.problem, ...(report.server === undefined ? {} : { server: report.server }) }, surface)
 }
 
-// A part of the report: a bold title, an optional dim line under it, then the content.
-function part(el: DetailElements, key: string, title: string, label: string | undefined, children: JSX.Children): JSX.Element {
+// The Setup state of the failed copy of the screenshot of a report, or undefined when no state fits.
+async function thumbGuide(
+  $: Engine,
+  report: TuixReport | undefined,
+  copies: Record<string, TuixThumb>,
+  surface: RenderSurface,
+): Promise<SetupGuide | undefined> {
+  const shot = pictureShot(report?.detail?.context?.screenshots ?? null)
+  const copy = shot === undefined ? undefined : copies[shot.id]
+
+  if (copy?.phase !== 'error' || copy.problem === undefined) {
+    return undefined
+  }
+
+  return guideOf($, { phase: 'error', problem: copy.problem, ...(copy.server === undefined ? {} : { server: copy.server }) }, surface)
+}
+
+// A part of the report: a heading, an optional dim line under it, then the content. The heading is bold
+// text, and a small picture of the word on the Desktop app. A count (`(2)`) follows it in text.
+function part(
+  el: DetailElements,
+  Svg: MaybeSvg,
+  key: string,
+  title: SectionLabel,
+  label: string | undefined,
+  children: JSX.Children,
+  count?: string,
+): JSX.Element {
   const { Box, Text } = el
 
   return (
     <Box key={key} flexDirection="column">
-      <Text bold>{title}</Text>
+      {Svg === undefined ? (
+        <Text bold>{count === undefined ? title : `${title} ${count}`}</Text>
+      ) : (
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          {pictureOf(Svg, sectionLabelSvg(title))}
+          {count !== undefined && <Text dimColor>{count}</Text>}
+        </Box>
+      )}
       {label !== undefined && (
         <Text dimColor wrap="wrap">
           {label}
@@ -1100,7 +1288,8 @@ function part(el: DetailElements, key: string, title: string, label: string | un
 }
 
 // Where the report was made: the page, the route, the browser, and on the Desktop app the locator picture.
-function whereView(el: DetailElements, context: TuixContext, Svg: DesktopElements['Svg'] | undefined): JSX.Element | null {
+// The drawing is for a report with no screenshot picture to show: `isPictured` (the picture is ready) leaves it out.
+function whereView(el: DetailElements, context: TuixContext, Svg: MaybeSvg, isPictured: boolean): JSX.Element | null {
   const { Text } = el
   const lines = whereLines(context)
   const input = {
@@ -1108,14 +1297,14 @@ function whereView(el: DetailElements, context: TuixContext, Svg: DesktopElement
     viewport: context.element?.viewport ?? context.browser?.viewport ?? null,
     scroll: context.element?.scroll ?? null,
   }
-  const locator = Svg === undefined ? undefined : locatorSvg(input)
+  const locator = Svg === undefined || isPictured ? undefined : locatorSvg(input)
   const numbers = locatorText(input)
 
   if (lines.length === 0 && numbers === undefined) {
     return null
   }
 
-  return part(el, 'where', 'Where', undefined, [
+  return part(el, Svg, 'where', 'Where', undefined, [
     ...lines.map((one, index) => (
       <Text key={`where-${index}`} dimColor wrap="wrap">
         {one}
@@ -1132,7 +1321,7 @@ function whereView(el: DetailElements, context: TuixContext, Svg: DesktopElement
   ])
 }
 
-function elementView(el: DetailElements, element: TuixElement): JSX.Element | null {
+function elementView(el: DetailElements, Svg: MaybeSvg, element: TuixElement): JSX.Element | null {
   const { Code, Text } = el
   const { selectors, facts } = elementLines(element)
 
@@ -1140,7 +1329,7 @@ function elementView(el: DetailElements, element: TuixElement): JSX.Element | nu
     return null
   }
 
-  return part(el, 'element', 'Element', undefined, [
+  return part(el, Svg, 'element', 'Element', undefined, [
     selectors.length > 0 && <Code key="selectors" source={selectors.join('\n')} />,
     ...facts.map((one, index) => (
       <Text key={`element-${index}`} wrap="wrap">
@@ -1151,18 +1340,18 @@ function elementView(el: DetailElements, element: TuixElement): JSX.Element | nu
 }
 
 // The console and the network entries: Code blocks that say they are data.
-function logsView(el: DetailElements, context: TuixContext, isNarrowed: boolean): JSX.Element[] {
+function logsView(el: DetailElements, Svg: MaybeSvg, context: TuixContext, isNarrowed: boolean): JSX.Element[] {
   const { Text, Code } = el
 
   if (context.diagnosticsIncluded === false) {
-    return [part(el, 'logs', 'Console and network', undefined, <Text wrap="wrap">{DIAGNOSTICS_HINT}</Text>)]
+    return [part(el, Svg, 'logs', 'Console and network', undefined, <Text wrap="wrap">{DIAGNOSTICS_HINT}</Text>)]
   }
 
   if (isNarrowed) {
-    return [part(el, 'logs', 'Console and network', undefined, <Text wrap="wrap">{NARROWED_TEXT}</Text>)]
+    return [part(el, Svg, 'logs', 'Console and network', undefined, <Text wrap="wrap">{NARROWED_TEXT}</Text>)]
   }
 
-  const logs: [string, string, string | null][] = [
+  const logs: [string, SectionLabel, string | null][] = [
     ['console', 'Console', context.console === null ? null : consoleSource(context.console)],
     ['network', 'Network', context.network === null ? null : networkSource(context.network)],
   ]
@@ -1173,6 +1362,7 @@ function logsView(el: DetailElements, context: TuixContext, isNarrowed: boolean)
       : [
           part(
             el,
+            Svg,
             key,
             title,
             DATA_LABEL,
@@ -1182,11 +1372,45 @@ function logsView(el: DetailElements, context: TuixContext, isNarrowed: boolean)
   )
 }
 
-// One row for each screenshot. Open screenshot asks Tuix for a new link; the link, or the reason there is none, replaces the button.
-function screenshotsView($: Engine, el: DetailElements, issueId: string, context: TuixContext, parts: DetailParts): JSX.Element | null {
+// One row of a screenshot: its facts, and Open screenshot, which asks Tuix for a new link; the link, or the
+// reason there is none, replaces the button.
+function shotRow($: Engine, el: DetailElements, issueId: string, shot: TuixScreenshot, parts: DetailParts): JSX.Element {
   const { Box, Button, Link, Text } = el
-  const list = context.screenshots ?? []
-  const color = errorColor(parts)
+  const link = parts.links[shot.id]
+  const isFresh = link?.phase === 'ready' && parts.now - link.at < SHOT_FRESH_MS
+  // A link that says loading while no read runs for it was left behind, so the button comes back.
+  const isLoading = link?.phase === 'loading' && running.has(`shot:${shot.id}`)
+
+  return (
+    <Box key={`shot-row-${shot.id}`} flexDirection="column">
+      <Box flexDirection="row" gap={1} flexWrap="wrap" alignItems="center">
+        <Text wrap="wrap">{shotText(shot, parts.now)}</Text>
+        {isLoading && <Text dimColor>Getting a new link…</Text>}
+        {link?.phase === 'ready' && isFresh && link.href !== null && <Link href={link.href} label={link.text} />}
+        {link?.phase === 'ready' && isFresh && link.href === null && <Text wrap="wrap">{link.text}</Text>}
+        {!isLoading && !isFresh && (
+          <Button key={`shot-${shot.id}`} label="Open screenshot" onPress={() => openShot($, issueId, shot.id)} />
+        )}
+      </Box>
+      {link?.phase === 'error' && (
+        <Text color={errorColor(parts)} wrap="wrap">
+          {link.message}
+        </Text>
+      )}
+    </Box>
+  )
+}
+
+// One row for each screenshot, but the one the report view shows as a picture: its row is under the picture.
+function screenshotsView(
+  $: Engine,
+  el: DetailElements,
+  issueId: string,
+  context: TuixContext,
+  parts: DetailParts,
+  pictured: string | undefined,
+): JSX.Element | null {
+  const list = (context.screenshots ?? []).filter(shot => shot.id !== pictured)
 
   if (list.length === 0) {
     return null
@@ -1194,37 +1418,54 @@ function screenshotsView($: Engine, el: DetailElements, issueId: string, context
 
   return part(
     el,
+    parts.Svg,
     'screenshots',
     'Screenshots',
     undefined,
-    list.map(shot => {
-      const link = parts.links[shot.id]
-      const isFresh = link?.phase === 'ready' && parts.now - link.at < SHOT_FRESH_MS
-      // A link that says loading while no read runs for it was left behind, so the button comes back.
-      const isLoading = link?.phase === 'loading' && running.has(`shot:${shot.id}`)
-
-      return (
-        <Box key={`shot-row-${shot.id}`} flexDirection="column">
-          <Box flexDirection="row" gap={1} flexWrap="wrap" alignItems="center">
-            <Text wrap="wrap">{shotText(shot, parts.now)}</Text>
-            {isLoading && <Text dimColor>Getting a new link…</Text>}
-            {link?.phase === 'ready' && isFresh && link.href !== null && <Link href={link.href} label={link.text} />}
-            {link?.phase === 'ready' && isFresh && link.href === null && (
-              <Text wrap="wrap">{link.text}</Text>
-            )}
-            {!isLoading && !isFresh && (
-              <Button key={`shot-${shot.id}`} label="Open screenshot" onPress={() => openShot($, issueId, shot.id)} />
-            )}
-          </Box>
-          {link?.phase === 'error' && (
-            <Text color={color} wrap="wrap">
-              {link.message}
-            </Text>
-          )}
-        </Box>
-      )
-    }),
+    list.map(shot => shotRow($, el, issueId, shot, parts)),
   )
+}
+
+// The screenshot of the report on the Desktop app: the small copy the mod made, with its row under it. Until
+// there is a copy it says so, or has a button to make one, which asks the person when no rule allows the read.
+function thumbView(
+  $: Engine,
+  el: DetailElements,
+  Svg: DesktopElements['Svg'],
+  issueId: string,
+  shot: TuixScreenshot,
+  copy: TuixThumb | undefined,
+  parts: DetailParts,
+): JSX.Element {
+  const { Box, Button, Text } = el
+  const isReading = copy?.phase === 'loading' && running.has(`thumb:${shot.id}`)
+  // A copy that says loading while no read runs for it was left behind, so the button comes back.
+  const isWaiting = copy === undefined || (copy.phase === 'loading' && !isReading)
+  // The Setup state has a Try again of its own, which a failed report has too, so only one of them shows.
+  const guide = parts.guide === undefined && parts.report?.phase !== 'error' ? parts.thumbGuide : undefined
+
+  return part(el, Svg, 'screenshot', 'Screenshot', undefined, [
+    copy?.phase === 'ready' && <Svg key="thumb" source={copy.source} alt={SCREENSHOT_ALT} />,
+    copy?.phase === 'ready' && shotRow($, el, issueId, shot, parts),
+    isReading && (
+      <Text key="thumb-reading" dimColor>
+        Getting the screenshot…
+      </Text>
+    ),
+    isWaiting && (
+      <Box key="thumb-show-row">
+        <Button key="thumb-show" label="Show screenshot" onPress={() => startThumb($, issueId, shot.id)} />
+      </Box>
+    ),
+    copy?.phase === 'error' &&
+      (guide === undefined ? (
+        <Text key="thumb-error" dimColor wrap="wrap">
+          {copy.message}
+        </Text>
+      ) : (
+        setupView($, el, guide, copy.message, parts.copied, () => startThumb($, issueId, shot.id))
+      )),
+  ])
 }
 
 // The comments the pane holds. The server lists the oldest first, so Load more comments adds newer ones.
@@ -1244,8 +1485,9 @@ function commentsView(
 
   return part(
     el,
+    parts.Svg,
     'comments',
-    `Comments (${comments.length}${more ? '+' : ''})`,
+    'Comments',
     undefined,
     [
       comments.length === 0 && <Text dimColor>No comments.</Text>,
@@ -1270,10 +1512,11 @@ function commentsView(
         </Text>
       ),
     ],
+    `(${comments.length}${more ? '+' : ''})`,
   )
 }
 
-function activityView(el: DetailElements, context: TuixContext, now: number): JSX.Element | null {
+function activityView(el: DetailElements, Svg: MaybeSvg, context: TuixContext, now: number): JSX.Element | null {
   const { Text } = el
   const history = context.workflow?.history ?? []
 
@@ -1283,6 +1526,7 @@ function activityView(el: DetailElements, context: TuixContext, now: number): JS
 
   return part(
     el,
+    Svg,
     'activity',
     'Activity',
     context.workflow?.hasMoreHistory === true ? `The last ${LIMITS.history} entries.` : undefined,
@@ -1303,7 +1547,7 @@ function detailView($: Engine, el: DetailElements, parts: DetailParts): JSX.Elem
   const context = detail?.context ?? null
   const shown = detail?.issue ?? issue
   const url = appLink(shown.appUrl ?? issue.appUrl)
-  const badge = Svg === undefined ? undefined : badgeSvg(shown)
+  const meta = Svg === undefined ? undefined : metaSvg(metaOf(shown))
   const color = errorColor(parts)
   const assignee = context?.workflow?.assignee ?? null
   const facts = [
@@ -1316,13 +1560,18 @@ function detailView($: Engine, el: DetailElements, parts: DetailParts): JSX.Elem
   ]
   const isReading = report?.phase === 'loading' && running.has(`report:${issue.id}`)
   const retry = () => startReport($, issue, true)
+  // The Desktop app shows the screenshot of the report. The vector drawing of Where shows until the picture
+  // of the screenshot is ready: for a report with no screenshot, one with no rule to read it, and one whose copy failed.
+  const shot = Svg === undefined || context === null ? undefined : pictureShot(context.screenshots)
+  const copy = shot === undefined ? undefined : parts.thumbs?.[shot.id]
   const sections = [
-    context !== null && whereView(el, context, Svg),
-    context !== null && context.element !== null && elementView(el, context.element),
-    ...(context === null ? [] : logsView(el, context, detail?.isNarrowed === true)),
-    context !== null && screenshotsView($, el, issue.id, context, parts),
+    Svg !== undefined && context !== null && shot !== undefined && thumbView($, el, Svg, issue.id, shot, copy, parts),
+    context !== null && whereView(el, context, Svg, copy?.phase === 'ready'),
+    context !== null && context.element !== null && elementView(el, Svg, context.element),
+    ...(context === null ? [] : logsView(el, Svg, context, detail?.isNarrowed === true)),
+    context !== null && screenshotsView($, el, issue.id, context, parts, copy?.phase === 'ready' ? shot?.id : undefined),
     detail !== undefined && report !== undefined && commentsView($, el, issue.id, report, detail, parts),
-    context !== null && activityView(el, context, now),
+    context !== null && activityView(el, Svg, context, now),
   ]
 
   return (
@@ -1340,8 +1589,8 @@ function detailView($: Engine, el: DetailElements, parts: DetailParts): JSX.Elem
       ) : (
         <Box flexDirection="column">
           <Box flexDirection="row" columnGap={1} alignItems="center">
-            {badge !== undefined && <Svg source={badge.source} alt={badge.alt} width={badge.width} height={badge.height} />}
-            <Text dimColor>{`${shown.reference} · ${STATUS_LABEL[shown.status]}`}</Text>
+            {pictureOf(Svg, statusChipSvg(shown.status))}
+            {meta !== undefined && pictureOf(Svg, meta)}
           </Box>
           <Text bold wrap="wrap">
             {shown.title}
@@ -1590,10 +1839,14 @@ export const register: Register = (on, options) => {
     if (issue !== undefined) {
       const report = all[issue.id]
 
+      const copies = await read($, thumbs)
+
       return detailView($, el, {
         issue,
         report,
         links: await read($, shots),
+        thumbs: copies,
+        thumbGuide: await thumbGuide($, report, copies, e.surface),
         now,
         guide: await reportGuide($, report, e.surface),
         copied: await read($, note),
@@ -1605,6 +1858,8 @@ export const register: Register = (on, options) => {
     const pageCount = await read($, pages)
     const chip = chipText(await accessOf($))
     const warning = await warningOf($)
+    // A Button that holds Text, so that the title is the press. Before 2.1.295 the engine refuses it, and the card has Details.
+    const isTitleButton = hasFeature(await read($, engine), 'textButtons')
     const heading =
       state.phase === 'loading'
         ? 'Loading…'
@@ -1613,6 +1868,10 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" columnGap={1} alignItems="center" flexWrap="wrap">
+          <Box flexDirection="row" alignItems="flex-end">
+            <Text bold>tuix</Text>
+            {pictureOf(Svg, wordmarkDotSvg())}
+          </Box>
           {projectPicker}
           <Select
             key="status"
@@ -1631,17 +1890,19 @@ export const register: Register = (on, options) => {
         {warning !== undefined && <Text wrap="wrap">{warning}</Text>}
         {(await read($, isDiagnosing)) && diagnosticsView($, el, await doctorFacts($), await read($, note))}
         <Text dimColor>{heading}</Text>
-        {state.phase !== 'loading' && list.length === 0 && <Text dimColor>Nothing here.</Text>}
+        {state.phase !== 'loading' && list.length === 0 && (
+          <Text dimColor>{`No ${STATUS_LABEL[status].toLowerCase()} issues in ${current.name}.`}</Text>
+        )}
         {list.map(one =>
-          issueCard(
-            el,
-            one,
-            now,
-            <Box flexDirection="row" columnGap={1}>
-              <Button key={`issue-${one.id}`} label="Details" onPress={() => showIssue($, one)} />
-              <Button key={`fix-${one.id}`} label="Fix with Claude" onPress={() => startFix($, one)} />
-            </Box>,
-          ),
+          issueCard(el, one, now, {
+            ...(isTitleButton ? { open: () => showIssue($, one) } : {}),
+            actions: (
+              <Box flexDirection="row" columnGap={1}>
+                {!isTitleButton && <Button key={`issue-${one.id}`} label="Details" onPress={() => showIssue($, one)} />}
+                <Button key={`fix-${one.id}`} label="Fix with Claude" onPress={() => startFix($, one)} />
+              </Box>
+            ),
+          }),
         )}
         {more && state.phase !== 'loading' && pageCount < MAX_PAGES && (
           <Box>
@@ -1681,7 +1942,7 @@ export const register: Register = (on, options) => {
         {shown.map(one => {
           const link = appLink(one.appUrl)
 
-          return issueCard(el, one, now, link === null ? undefined : <Link href={link} label="Open in Tuix" />)
+          return issueCard(el, one, now, link === null ? {} : { actions: <Link href={link} label="Open in Tuix" /> })
         })}
         <Text dimColor>
           {found.length > shown.length

@@ -120,6 +120,13 @@ export type TuixShotLink =
   | { phase: 'ready'; href: string | null; text: string; at: number }
   | { phase: 'error'; message: string }
 
+// The small copy of a screenshot, made by the mod on the computer of the person: the Svg source of the
+// picture and its size. A failure keeps the Setup state that fits it, when one does, and the server.
+export type TuixThumb =
+  | { phase: 'loading' }
+  | { phase: 'ready'; source: string; width: number; height: number }
+  | { phase: 'error'; message: string; problem?: Problem; server?: string }
+
 // The Setup state that a failed call asks for.
 export type Problem = 'no-server' | 'sign-in' | 'not-allowed' | 'no-verdict'
 
@@ -155,6 +162,8 @@ declare module 'claude-code' {
       // The full reports read in this session, by issue ID, and the fresh screenshot links, by screenshot ID.
       reports: Record<string, TuixReport>
       shots: Record<string, TuixShotLink>
+      // The small copies of screenshots, by screenshot ID. At most four are ready: the oldest go first.
+      thumbs: Record<string, TuixThumb>
       load: TuixLoad
       described: string[]
       engine: string | null
