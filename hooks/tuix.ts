@@ -20,14 +20,19 @@ import type {
   TuixReport,
   TuixScreenshot,
   TuixSize,
+  TuixThumb,
   TuixWorkflow,
 } from '../types'
+import { MUTED, PEACH, PEACH_TEXT, round } from './look'
+import type { Picture, Tone } from './look'
+import { BASE64 } from './thumbnail'
+import type { Thumbnail } from './thumbnail'
 
 // Report text comes from the people who use the reported app.
 // We draw it as plain text and never put it in a prompt.
 
 // The version of the mod. A test holds it equal to `version` in .claude-plugin/plugin.json.
-export const VERSION = '0.2.0'
+export const VERSION = '0.3.0'
 
 // The oldest Claude Code release the mod runs on.
 export const MIN_ENGINE = '2.1.286'
@@ -125,7 +130,7 @@ export function mcpServersOf(toolNames: readonly string[]): string[] {
 }
 
 // The first Claude Code release that has what each part of the mod needs.
-export const FEATURES = { cards: '2.1.289', writes: '2.1.292', trustReads: '2.1.292' } as const
+export const FEATURES = { cards: '2.1.289', writes: '2.1.292', trustReads: '2.1.292', textButtons: '2.1.295' } as const
 
 export type Feature = keyof typeof FEATURES
 
@@ -599,8 +604,6 @@ export function failureText(result: McpToolResult): string {
 export type McpImage = { mediaType: string; data: string }
 
 const IMAGE_TYPE = /^image\/(?:png|jpeg|gif|webp)$/
-const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/
-
 /**
  * Returns the first image of an MCP result. Claude Code hands an image as
  * `{ source: { media_type, data } }` and a plain MCP block is `{ data, mimeType }`.
@@ -723,6 +726,9 @@ export const MAX_COMMENTS = 40
 // The most full reports, and the most screenshot links, the pane keeps in a session.
 export const MAX_REPORTS = 10
 export const MAX_SHOTS = 40
+
+// The most small copies of screenshots the pane keeps, each about 100 KB of drawing.
+export const MAX_THUMBS = 4
 
 // The pane draws a screenshot link for four minutes. The server signs it for five.
 export const SHOT_FRESH_MS = 240_000
@@ -1180,6 +1186,43 @@ export function shotText(shot: TuixScreenshot, now: number): string {
 }
 
 /**
+ * Returns the screenshot the report view draws: the first original, else the first one.
+ */
+export function pictureShot(list: readonly TuixScreenshot[] | null): TuixScreenshot | undefined {
+  return list?.find(shot => shot.kind === 'original') ?? list?.[0]
+}
+
+const OMITTED_TEXT = 'The screenshot is too large to show here. Open screenshot has the full size.'
+
+/**
+ * Returns the image of a get_screenshot answer, or throws with the reason there is none. Claude Code puts a
+ * text block about the file before the server's own text block, so the JSON is the first text that parses.
+ */
+export function screenshotOf(result: McpToolResult): McpImage {
+  const texts = result.content.flatMap(block => (block.type === 'text' && typeof block.text === 'string' ? [block.text] : []))
+  const data = texts.map(one => parse(one)).find(one => one !== undefined)
+
+  if (result.isError) {
+    const error = isRecord(data?.error) ? data.error : undefined
+    const message = typeof error?.message === 'string' ? error.message : (texts[0] ?? 'the call failed')
+
+    throw new TuixError(`Tuix: ${oneLine(message, 200)}`)
+  }
+
+  if (texts.some(one => one.startsWith('Error: result (') && one.includes('saved to'))) {
+    throw new TuixResultTooLarge()
+  }
+
+  const image = imageOf(result)
+
+  if (image === undefined) {
+    throw new TuixError(typeof data?.image_omitted === 'string' ? OMITTED_TEXT : 'Tuix sent no image.')
+  }
+
+  return image
+}
+
+/**
  * Returns the line above a comment: the author and the age.
  */
 export function commentHead(comment: TuixComment, now: number): string {
@@ -1204,6 +1247,22 @@ export function remember<T>(record: Readonly<Record<string, T>>, key: string, va
 }
 
 /**
+ * Returns `record` with the small copy `value` as its newest entry. It keeps at most MAX_THUMBS ready
+ * copies (the oldest go first), and at most MAX_SHOTS entries of any phase.
+ */
+export function rememberThumb(
+  record: Readonly<Record<string, TuixThumb>>,
+  key: string,
+  value: TuixThumb,
+): Record<string, TuixThumb> {
+  const next = remember(record, key, value, MAX_SHOTS)
+  const ready = Object.keys(next).filter(name => next[name]?.phase === 'ready')
+  const drop = new Set(ready.slice(0, Math.max(0, ready.length - MAX_THUMBS)))
+
+  return Object.fromEntries(Object.entries(next).filter(([name]) => !drop.has(name)))
+}
+
+/**
  * Says whether the pane reads the report of an issue again when the person
  * opens it: it has none, the last read failed, or the list is newer than it.
  * A report newer than the list stays: the list is the one that is old.
@@ -1216,6 +1275,15 @@ export function needsReport(report: TuixReport | undefined, issue: Pick<TuixIssu
   const read = Date.parse(report.detail?.issue.updatedAt ?? '')
 
   return Number.isNaN(read) || (!Number.isNaN(listed) && listed > read)
+}
+
+/**
+ * Says whether the pane starts the copy of a screenshot on its own: it has not tried yet, or the read is forced
+ * (Reload). A copy that says loading while no read runs for it was left behind by a read that died: it is not
+ * read again by itself, and the Show screenshot button reads it.
+ */
+export function needsThumb(copy: TuixThumb | undefined, isForced: boolean): boolean {
+  return copy === undefined || isForced
 }
 
 // The hosted server says "Unknown argument" and does not name it; the stdio adapter says
@@ -1336,46 +1404,278 @@ export function issuesOf(kind: TuixToolKind, data: Record<string, unknown>): Tui
   return kind === 'get_issue' ? parseIssues({ issues: [data.issue] }) : parseIssues(data)
 }
 
-const TYPE_LABEL: Record<string, string> = { bug: 'Bug', ux: 'UX', question: 'Question', idea: 'Idea' }
-const SEVERITY_FILL: Record<string, string> = { blocking: '#c62828', major: '#b45309', minor: '#4b5563' }
+export type IssueType = 'bug' | 'ux' | 'question' | 'idea'
+export type IssueSeverity = 'blocking' | 'major' | 'minor'
 
-export type Badge = { source: string; alt: string; width: number; height: number }
+const TYPE_LABEL: Record<IssueType, string> = { bug: 'Bug', ux: 'UX', question: 'Question', idea: 'Idea' }
+const SEVERITY_LABEL: Record<IssueSeverity, string> = { blocking: 'Blocking', major: 'Major', minor: 'Minor' }
 
 /**
- * Returns an SVG of an issue's type and severity as two pills, or undefined
- * when it has neither. It holds fixed labels only, never report text.
+ * Returns the type a report names when it is one of the four types, or null.
  */
-export function badgeSvg(issue: Pick<TuixIssue, 'type' | 'severity'>): Badge | undefined {
-  const pills: { label: string; fill: string }[] = []
-  const type = issue.type === null ? undefined : TYPE_LABEL[issue.type]
-  const fill = issue.severity === null ? undefined : SEVERITY_FILL[issue.severity]
-
-  if (type !== undefined) pills.push({ label: type, fill: '#475569' })
-  if (fill !== undefined && issue.severity !== null) pills.push({ label: capitalize(issue.severity), fill })
-  if (pills.length === 0) return undefined
-
-  const height = 18
-  let x = 0
-  const shapes = pills.map(pill => {
-    const width = Math.round(pill.label.length * 6.6 + 16)
-    const shape =
-      `<rect x="${x}" y="0" width="${width}" height="${height}" rx="9" fill="${pill.fill}"/>` +
-      `<text x="${x + width / 2}" y="12.5" fill="#ffffff" text-anchor="middle">${pill.label}</text>`
-    x += width + 6
-
-    return shape
-  })
-  const width = x - 6
-  const source =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" ` +
-    `font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="11" font-weight="600">` +
-    `${shapes.join('')}</svg>`
-
-  return { source, alt: pills.map(pill => pill.label).join(', '), width, height }
+export function issueTypeOf(value: string | null): IssueType | null {
+  return (Object.keys(TYPE_LABEL) as IssueType[]).find(key => key === value) ?? null
 }
 
-function capitalize(value: string): string {
-  return value.charAt(0).toUpperCase() + value.slice(1)
+/**
+ * Returns the severity a report names when it is one of the three, or null.
+ */
+export function issueSeverityOf(value: string | null): IssueSeverity | null {
+  return (Object.keys(SEVERITY_LABEL) as IssueSeverity[]).find(key => key === value) ?? null
+}
+
+// The headings of the parts of a report. The Desktop app draws them as pictures.
+export const SECTION_LABELS = [
+  'Where',
+  'Element',
+  'Console and network',
+  'Console',
+  'Network',
+  'Screenshot',
+  'Screenshots',
+  'Comments',
+  'Activity',
+] as const
+
+export type SectionLabel = (typeof SECTION_LABELS)[number]
+
+// The Tuix look (Evening Light, hooks/look.ts) for the pictures the Desktop app draws. The app draws an SVG
+// as an image: it has system fonts only and cannot read the theme of the pane, and the colour scheme the
+// image sees may not be the theme of the pane. So each picture holds the light palette and, under
+// prefers-color-scheme, the dark one, and each has to read on a light pane and on a dark one, in both: a
+// chip is an opaque shape with its word on it, and a text colour is a mid tone that reads on both grounds.
+// The light colour is also on each shape, for a surface that drops the <style>. The words are fixed ones.
+// A report's text never gets here.
+
+// The status chips: a ground and an ink for each state, in the colours of the dashboard. The dark grounds
+// are opaque (the translucent colours of the dashboard over its dark pane, #262624), so a chip is the same
+// on any pane.
+const OPEN: { bg: Tone; ink: Tone } = { bg: ['#fde6dc', '#493d35'], ink: ['#8a3a1a', '#ffc8ae'] }
+const IN_PROGRESS: { bg: Tone; ink: Tone } = { bg: ['#fbf0cf', '#474235'], ink: ['#6b5210', '#f6dc9c'] }
+const IN_REVIEW: { bg: Tone; ink: Tone } = { bg: ['#d9f2ed', '#33403c'], ink: ['#0f5c52', '#9ae8da'] }
+const SETTLED: { bg: Tone; ink: Tone } = { bg: ['#ebe7f6', '#3a383d'], ink: ['#4c4570', '#d3ccf0'] }
+
+const STATUS_TONE: Record<IssueStatus, { bg: Tone; ink: Tone }> = {
+  open: OPEN,
+  in_progress: IN_PROGRESS,
+  in_review: IN_REVIEW,
+  done: SETTLED,
+  wont_fix: SETTLED,
+  closed: SETTLED,
+}
+
+const SANS = "Karla, 'Segoe UI', system-ui, -apple-system, sans-serif"
+const MONO = "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+// The widths of the letters a bold sans uses, in thousandths of the font size (Helvetica Bold). A
+// system font is a little different, so the text carries its length and the drawing never clips.
+const SANS_WIDTH: Record<string, number> = {
+  ' ': 278, "'": 238, C: 722, D: 722, I: 278, O: 778, W: 944,
+  a: 556, b: 611, c: 556, d: 611, e: 556, f: 333, g: 611, h: 611, i: 278, j: 278, k: 556, l: 278, m: 889,
+  n: 611, o: 611, p: 611, q: 611, r: 389, s: 556, t: 333, u: 611, v: 556, w: 778, x: 556, y: 556, z: 500,
+}
+
+function sansWidth(value: string, size: number): number {
+  return [...value].reduce((sum, letter) => sum + (SANS_WIDTH[letter] ?? 600), 0) * 0.96 * (size / 1000)
+}
+
+// The width of a line of a mono font: 0.6 of the size for each letter, and the letter spacing after it.
+function monoWidth(letters: number, size: number, spacing: number): number {
+  return letters * (size * 0.6 + spacing)
+}
+
+/**
+ * Returns the text with the five characters of markup written as entities.
+ */
+export function escapeXml(value: string): string {
+  const entities: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }
+
+  return value.replace(/[&<>"']/g, letter => entities[letter] ?? letter)
+}
+
+// A picture: the style with the light colours and the dark ones, then the shapes. A shape names its
+// class and has the light colour as an attribute too. `rules` are more CSS, a light one and a dark one.
+// A picture with no class and no rule has no style: its colours are the same in both schemes.
+function picture(
+  width: number,
+  height: number,
+  classes: Record<string, Tone>,
+  shapes: string,
+  rules: { light: string; dark: string } = { light: '', dark: '' },
+): string {
+  const entries = Object.entries(classes)
+  const light = entries.map(([name, tone]) => `.${name}{fill:${tone[0]}}`).join('')
+  const dark = entries.map(([name, tone]) => `.${name}{fill:${tone[1]}}`).join('')
+  const style =
+    entries.length === 0 && rules.light === '' && rules.dark === ''
+      ? ''
+      : `<style>${light}${rules.light}@media (prefers-color-scheme:dark){${dark}${rules.dark}}</style>`
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${style}${shapes}</svg>`
+}
+
+function paint(name: string, tone: Tone): string {
+  return `class="${name}" fill="${tone[0]}"`
+}
+
+/**
+ * Returns the chip of a status: the word on the pair of colours the dashboard uses.
+ * Open is peach, In progress gold, In review aqua, and the settled ones lavender.
+ */
+export function statusChipSvg(status: IssueStatus): Picture {
+  // A status the mod does not know reads as open, as parseIssues takes it.
+  const known: IssueStatus = STATUSES.has(status) ? status : 'open'
+  const tone = STATUS_TONE[known]
+  const label = STATUS_LABEL[known]
+  const length = round(sansWidth(label, 11))
+  const width = Math.round(length + 20)
+  const height = 20
+  const text =
+    `<text class="ink" fill="${tone.ink[0]}" x="${width / 2}" y="14.2" text-anchor="middle" font-family="${SANS}" font-size="11" ` +
+    `font-weight="700" textLength="${length}" lengthAdjust="spacingAndGlyphs">${escapeXml(label)}</text>`
+  const source = picture(
+    width,
+    height,
+    { bg: tone.bg, ink: tone.ink },
+    `<rect ${paint('bg', tone.bg)} width="${width}" height="${height}" rx="10"/>${text}`,
+  )
+
+  return { source, alt: label, width, height }
+}
+
+// A line of mono text in runs of one colour each. The text carries its length, so a font of another width keeps the line.
+type Run = { text: string; tone: Tone; name: string }
+
+function monoLine(runs: readonly Run[], size: number, spacing: number, y: number): { text: string; width: number } {
+  const letters = runs.reduce((sum, run) => sum + [...run.text].length, 0)
+  const length = round(monoWidth(letters, size, spacing))
+  const spans = runs.map(run => `<tspan class="${run.name}" fill="${run.tone[0]}">${escapeXml(run.text)}</tspan>`).join('')
+  const text =
+    `<text xml:space="preserve" x="0" y="${y}" font-family="${MONO}" font-size="${size}" letter-spacing="${spacing}" ` +
+    `textLength="${length}" lengthAdjust="spacing">${spans}</text>`
+
+  return { text, width: Math.ceil(length) }
+}
+
+// What the meta line takes of an issue: its number, and the type and severity when they are known words.
+export type MetaInput = { number: number; type: IssueType | null; severity: IssueSeverity | null }
+
+/**
+ * Returns the meta line of an issue, such as `#12 · BUG · BLOCKING`: the number in muted ink, and the
+ * type and the severity in small peach text. It is undefined when there is nothing to show.
+ */
+export function metaSvg(input: MetaInput): Picture | undefined {
+  const number = Number.isSafeInteger(input.number) && input.number >= 0 ? [`#${input.number}`] : []
+  const type = issueTypeOf(input.type)
+  const severity = issueSeverityOf(input.severity)
+  const words = [type === null ? '' : TYPE_LABEL[type], severity === null ? '' : SEVERITY_LABEL[severity]].filter(word => word !== '')
+
+  if (number.length + words.length === 0) {
+    return undefined
+  }
+
+  const runs = [
+    ...number.map(text => ({ text, tone: MUTED, name: 'm' })),
+    ...words.flatMap((word, index) => [
+      ...(index + number.length > 0 ? [{ text: ' · ', tone: MUTED, name: 'm' }] : []),
+      { text: word.toUpperCase(), tone: PEACH_TEXT, name: 'p' },
+    ]),
+  ]
+  const height = 16
+  const line = monoLine(runs, 10.5, 0.8, 11.5)
+  const source = picture(line.width, height, { m: MUTED, p: PEACH_TEXT }, line.text)
+
+  return { source, alt: [...number, ...words].join(', '), width: line.width, height }
+}
+
+/**
+ * Returns the heading of a part of a report: the word in small mono capitals and muted ink.
+ */
+export function sectionLabelSvg(label: SectionLabel): Picture {
+  const known = SECTION_LABELS.find(one => one === label) ?? ''
+  const height = 22
+  const line = monoLine([{ text: known.toUpperCase(), tone: MUTED, name: 'm' }], 10.5, 1.15, 16)
+  const source = picture(Math.max(1, line.width), height, { m: MUTED }, known === '' ? '' : line.text)
+
+  return { source, alt: known, width: Math.max(1, line.width), height }
+}
+
+// The dot of the wordmark. The Desktop app draws the word `tuix` as bold Text and the dot beside it as this
+// picture: no ink for a word reads on a light pane and on a dark one, but the peach does, so the dot is a
+// picture and the word takes the colour of the pane. The dot is about the size of a full stop at 14 pixels.
+// The row aligns to the end, so the foot of the picture is the foot of the line of Text, a little below its
+// baseline. The foot of the dot is 5.4 pixels above the foot of the picture, which puts it on the baseline to
+// within a pixel for a sans font of 13 to 15 pixels and a line height of 1.3 to 1.5. The dot is a little left
+// of the middle, so the space after the word is small, and the glow that reaches past the left edge is too
+// faint there to show a cut.
+const DOT_RADIUS = 2.1
+const DOT_REACH = 6
+const DOT_WIDTH = 12
+const DOT_HEIGHT = 14
+const DOT_X = 5
+const DOT_Y = 6.5
+
+/**
+ * Returns the dot of the wordmark: the round peach dot with its soft glow. It holds no text and has one
+ * colour in both schemes. Beside the word `tuix` in bold Text it makes the wordmark.
+ */
+export function wordmarkDotSvg(): Picture {
+  const stop = (offset: number, opacity: number) => `<stop offset="${offset}" stop-color="${PEACH}" stop-opacity="${opacity}"/>`
+  const gradient = `<defs><radialGradient id="glow">${stop(0, 0.45)}${stop(0.3, 0.34)}${stop(0.6, 0.12)}${stop(1, 0)}</radialGradient></defs>`
+  const shapes =
+    gradient +
+    `<circle cx="${DOT_X}" cy="${DOT_Y}" r="${DOT_REACH}" fill="url(#glow) none"/>` +
+    `<circle cx="${DOT_X}" cy="${DOT_Y}" r="${DOT_RADIUS}" fill="${PEACH}"/>`
+
+  return { source: picture(DOT_WIDTH, DOT_HEIGHT, {}, shapes), alt: 'dot', width: DOT_WIDTH, height: DOT_HEIGHT }
+}
+
+// The ground of a screenshot picture before its image shows, and the line round it: the lavender of the
+// settled chips, and the line of the dashboard.
+const SHOT_GROUND: Tone = SETTLED.bg
+const SHOT_LINE: Tone = ['#d6cfea', '#453b70']
+
+// What the screenshot picture says in words. The words are ours: no text of a report goes in it.
+export const SCREENSHOT_ALT = 'Screenshot of the reported page'
+
+// The most characters an Svg source may have.
+const SVG_LIMIT = 131_072
+
+/**
+ * Returns the picture of a small copy of a screenshot: the JPEG as an image inside a rounded clip, on a
+ * lavender box that names it, with a 1 pixel line round it. The box shows where a surface does not draw
+ * the image, and the word on it is `Screenshot`, a fixed one. Only the base64 (checked here) and whole numbers
+ * go in the markup. It is undefined when the
+ * copy is not fit to draw, or when the markup would pass the limit of an Svg.
+ */
+export function screenshotSvg(thumb: Thumbnail): Picture | undefined {
+  const { width, height, jpegBase64 } = thumb
+  const isSized = [width, height].every(side => Number.isInteger(side) && side >= 1 && side <= 4096)
+
+  if (!isSized || !BASE64.test(jpegBase64)) {
+    return undefined
+  }
+
+  // A copy of 800 pixels is drawn about 420 wide, so the radius and the line are scaled up to look as they do there.
+  const unit = round(Math.max(1, width / 420))
+  const radius = round(10 * unit)
+  const inset = round(unit / 2)
+  const clip = `<clipPath id="c"><rect width="${width}" height="${height}" rx="${radius}"/></clipPath>`
+  const word =
+    `<text class="t" fill="${MUTED[0]}" x="${round(width / 2)}" y="${round(height / 2 + 5 * unit)}" text-anchor="middle" ` +
+    `font-family="${SANS}" font-size="${round(14 * unit)}" font-weight="700">Screenshot</text>`
+  const shapes =
+    `<defs>${clip}</defs><g clip-path="url(#c)">` +
+    `<rect ${paint('f', SHOT_GROUND)} width="${width}" height="${height}"/>${word}` +
+    `<image href="data:image/jpeg;base64,${jpegBase64}" x="0" y="0" width="${width}" height="${height}" preserveAspectRatio="none"/></g>` +
+    `<rect class="b" fill="none" stroke="${SHOT_LINE[0]}" stroke-width="${unit}" x="${inset}" y="${inset}" ` +
+    `width="${round(width - unit)}" height="${round(height - unit)}" rx="${round(radius - inset)}"/>`
+  const source = picture(width, height, { f: SHOT_GROUND, t: MUTED }, shapes, {
+    light: `.b{stroke:${SHOT_LINE[0]}}`,
+    dark: `.b{stroke:${SHOT_LINE[1]}}`,
+  })
+
+  return source.length <= SVG_LIMIT ? { source, alt: SCREENSHOT_ALT, width, height } : undefined
 }
 
 /**

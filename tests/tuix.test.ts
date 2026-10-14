@@ -3,24 +3,31 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock, Mounted, Plugin } from 'claude-code/testing'
 
 import { LOCATOR_ALT, locatorSvg, locatorText } from '../hooks/locator'
+import type { Picture } from '../hooks/look'
+import { ALPHA_PNG, UI_JPEG, UI_PNG } from './fixtures/shots'
+import type { IssueStatus } from '../types'
 import {
   FEATURES,
   LIMITS,
   MAX_COMMENTS,
+  MAX_THUMBS,
   NARROW_SECTIONS,
   REPORT_SECTIONS,
   SCOPE_HINT,
+  SCREENSHOT_ALT,
+  SECTION_LABELS,
   SHOT_FRESH_MS,
+  STATUS_LABEL,
   TEXT_ONLY_HINT,
   TuixError,
   TuixFailure,
   TuixResultTooLarge,
   VERSION,
   appLink,
-  badgeSvg,
   chipText,
   describedTuixServer,
   doctorLines,
+  escapeXml,
   failureText,
   findTuixServer,
   fixPrompt,
@@ -30,7 +37,9 @@ import {
   isTextOnlyRefusal,
   isTuixToolName,
   mergeIssues,
+  metaSvg,
   needsReport,
+  needsThumb,
   oneLine,
   overallProblem,
   parseComments,
@@ -38,18 +47,24 @@ import {
   parseDetail,
   parseIssues,
   payloadOf,
+  pictureShot,
   problemOf,
   problemOfError,
   readRules,
   refusingRules,
   releaseOf,
   remember,
+  rememberThumb,
   screenshotLink,
+  screenshotOf,
+  screenshotSvg,
   screenshotUrls,
+  sectionLabelSvg,
   serverKey,
   setupGuide,
   sourceOf,
   sourceWarning,
+  statusChipSvg,
   toolName,
   toolPayload,
   toolsOf,
@@ -57,7 +72,9 @@ import {
   tuixToolKind,
   uniqueServers,
   versionAtLeast,
+  wordmarkDotSvg,
 } from '../hooks/tuix'
+import type { SectionLabel } from '../hooks/tuix'
 
 const NOW = Date.parse('2026-10-13T12:00:00Z')
 
@@ -273,6 +290,23 @@ type Setup = {
   report?: (args: Record<string, unknown>) => Record<string, unknown> | McpToolResult
   // Tools Claude Code has not been allowed to call; a test may empty the list.
   refusedTools?: string[]
+  // What get_screenshot answers for the arguments of a call, in place of the PNG; { deny } throws.
+  shot?: (args: Record<string, unknown>) => McpToolResult | { deny: string }
+  // Runs when the mod asks for the verdict on a tool, before it is answered: a test acts while the mod waits for it.
+  whileChecking?: (tool: string) => Promise<void> | void
+}
+
+// What get_screenshot answers as Claude Code hands it to a mod: the image block with a `source`, a text
+// block about the file Claude Code saved, and the server's own JSON text, in that order.
+function shotAnswer(args: Record<string, unknown>, image = { media_type: 'image/png', data: UI_PNG }): McpToolResult {
+  return {
+    content: [
+      { type: 'image', source: { type: 'base64', ...image } },
+      { type: 'text', text: '[Image: source: /tmp/claude/screenshot-1.png]' },
+      { type: 'text', text: JSON.stringify({ issue_id: args.issue_id, screenshot: { id: args.screenshot_id, kind: 'original', width: 1280, height: 720, byte_size: 182311 } }) },
+    ],
+    isError: false,
+  }
 }
 
 // As $.mcp.call hands a result to a mod: the text block, never structuredContent.
@@ -297,6 +331,8 @@ function world(on: On, setup: Setup = {}): World {
     during,
     report,
     refusedTools = [],
+    shot,
+    whileChecking,
   } = setup
   const seen: World = {
     calls: [],
@@ -355,12 +391,18 @@ function world(on: On, setup: Setup = {}): World {
       return { value: 'content' in answer ? (answer as McpToolResult) : reply(answer) }
     }
 
+    if (e.tool === 'get_screenshot') {
+      const answer = shot?.(e.args) ?? shotAnswer(e.args)
+
+      return 'deny' in answer ? { deny: answer.deny } : { value: answer }
+    }
+
     return { value: e.tool === 'list_issues' && issues !== undefined ? issues : reply(e.tool === 'list_projects' ? projects : ISSUES) }
   })
   on('tool.check', ($, e) => {
     seen.checks.push(e.tool)
 
-    return check(e.tool)
+    return whileChecking === undefined ? check(e.tool) : Promise.resolve(whileChecking(e.tool)).then(() => check(e.tool))
   })
   on('ui.copy', ($, e) => {
     seen.copied.push(e.text)
@@ -416,6 +458,32 @@ function pane($: Engine, surface: 'terminal' | 'desktop' | 'mobile') {
   return $.ui.mount({ plugin: 'tuix', surface, component: 'Pane', requestId: 'tuix', props: PANE_PROPS })
 }
 
+// Says whether the Claude Code that runs the tests draws a Button that holds Text (from 2.1.295). An older one
+// refuses the tree, so a test of the title as a button runs only where this is true.
+async function drawsTextButtons($: Engine, on: On): Promise<boolean> {
+  on('ui.render', { component: 'Pane', requestId: 'probe-text-button', surface: 'desktop' }, ($, e) => {
+    const { Button, Text } = $.ui.resolve(e)
+
+    return Button({ key: 'probe', plain: true, onPress: () => undefined, children: [Text({ children: ['Title'] })] })
+  })
+
+  try {
+    const ui = await $.ui.mount({
+      plugin: 'tuix',
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: 'probe-text-button',
+      props: PANE_PROPS,
+    })
+
+    await ui.unmount()
+
+    return true
+  } catch {
+    return false
+  }
+}
+
 // A mod that loads first and tells the manifest version of each mod, as a policy mod reads it.
 const manifestReader: Plugin = {
   name: 'manifest-reader',
@@ -465,17 +533,6 @@ describe('helpers', () => {
     expect(describedTuixServer('mcp__Feedback__list_projects', 'List Tuix projects.', 'engine')).toBeUndefined()
   })
 
-  test('draws type and severity badges from fixed labels only', () => {
-    const [blocking, minor] = parseIssues(ISSUES)
-    const badge = badgeSvg(blocking!)
-
-    expect(badge?.alt).toBe('Bug, Blocking')
-    expect(badge?.source).toContain('#c62828')
-    expect(badge?.source).not.toContain('Pay button')
-    expect(badgeSvg(minor!)?.alt).toBe('UX, Minor')
-    expect(badgeSvg({ type: null, severity: null })).toBeUndefined()
-  })
-
   test('knows the Tuix tools of a server that was found, and reads their stored output', () => {
     expect(tuixToolKind('mcp__Tuix__list_issues', 'Tuix')).toBe('list_issues')
     expect(tuixToolKind('mcp__claude_ai_Tuix__get_issue', 'claude.ai Tuix')).toBe('get_issue')
@@ -504,11 +561,13 @@ describe('helpers', () => {
     expect(releaseOf('')).toBeNull()
     expect(releaseOf(undefined)).toBeNull()
     expect(releaseOf(2.1)).toBeNull()
-    expect(FEATURES).toEqual({ cards: '2.1.289', writes: '2.1.292', trustReads: '2.1.292' })
+    expect(FEATURES).toEqual({ cards: '2.1.289', writes: '2.1.292', trustReads: '2.1.292', textButtons: '2.1.295' })
     expect(hasFeature('2.1.288', 'cards')).toBe(false)
     expect(hasFeature('2.1.289', 'cards')).toBe(true)
     expect(hasFeature('2.1.296', 'writes')).toBe(true)
     expect(hasFeature('2.1.291', 'trustReads')).toBe(false)
+    expect(hasFeature('2.1.294', 'textButtons')).toBe(false)
+    expect(hasFeature('2.1.295', 'textButtons')).toBe(true)
     expect(hasFeature(null, 'cards')).toBe(false)
     // The parts compare as numbers: 2.1.100 is after 2.1.99, and 2.2.0 after 2.1.296.
     expect(versionAtLeast('2.1.100', '2.1.99')).toBe(true)
@@ -553,6 +612,28 @@ describe('helpers', () => {
     expect(imageOf(result({ type: 'image', data: png }))).toBeUndefined()
     expect(imageOf(result({ type: 'text', text: png, data: png, mimeType: 'image/png' }))).toBeUndefined()
     expect(imageOf(result())).toBeUndefined()
+  })
+
+  test('reads the image of a get_screenshot answer, and says why there is none', () => {
+    const png = 'iVBORw0KGgo='
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } }
+    const note = { type: 'text', text: '[Image: source: /tmp/claude/screenshot-1.png]' }
+    const json = (data: Record<string, unknown>) => ({ type: 'text', text: JSON.stringify(data) })
+    const answer = (isError: boolean, ...content: McpToolResult['content']): McpToolResult => ({ content, isError })
+
+    // Claude Code puts its own text about the file before the server's JSON.
+    expect(screenshotOf(answer(false, image, note, json({ issue_id: 'i9' })))).toEqual({ mediaType: 'image/png', data: png })
+    expect(screenshotOf(answer(false, { type: 'image', data: png, mimeType: 'image/jpeg' }))).toEqual({ mediaType: 'image/jpeg', data: png })
+    // A refusal says what the server says, on one line.
+    expect(() => screenshotOf(answer(true, json({ error: { code: 'forbidden', message: 'No screenshots\nfor this connection.' } })))).toThrow('Tuix: No screenshots for this connection.')
+    expect(() => screenshotOf(answer(true, { type: 'text', text: 'MCP error -32602: bad' }))).toThrow('Tuix: MCP error -32602: bad')
+    expect(() => screenshotOf(answer(true))).toThrow('Tuix: the call failed')
+    // An image the server left out, one that is not a picture, and no image at all.
+    expect(() => screenshotOf(answer(false, json({ image_omitted: 'Too large.', screenshot: { url: 'https://x.example/' } })))).toThrow('The screenshot is too large to show here.')
+    expect(() => screenshotOf(answer(false, { type: 'image', data: png, mimeType: 'image/svg+xml' }, note))).toThrow('Tuix sent no image.')
+    expect(() => screenshotOf(answer(false, note, json({ ok: true })))).toThrow('Tuix sent no image.')
+    // Claude Code kept an answer that was too large.
+    expect(() => screenshotOf(answer(false, { type: 'text', text: 'Error: result (60,010 characters) exceeds maximum. Output has been saved to /tmp/1.json' }))).toThrow(TuixResultTooLarge)
   })
 
   test('names the link in the fix prompt only when it is on https://tuix.app/', () => {
@@ -1000,6 +1081,400 @@ describe('terminal pane', () => {
   })
 })
 
+// The words an SVG source draws: the text between its tags, outside the <style>, with the entities read back.
+function wordsDrawn(source: string): string {
+  return source
+    .replace(/<style>.*?<\/style>/s, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&#39;/g, "'")
+}
+
+// Whether the words of a picture are words of Tuix and no more: none (the dot, the locator), a status, a
+// heading, or the number with a type and a severity.
+function isFixedWords(words: string): boolean {
+  const fixed = ['', ...Object.values(STATUS_LABEL), ...SECTION_LABELS.map(label => label.toUpperCase())]
+
+  return fixed.includes(words) || /^#\d+(?: · (?:BUG|UX|QUESTION|IDEA))?(?: · (?:BLOCKING|MAJOR|MINOR))?$/.test(words)
+}
+
+describe('the Tuix look', () => {
+  const STATUSES = Object.keys(STATUS_LABEL) as IssueStatus[]
+  const TYPES = [null, 'bug', 'ux', 'question', 'idea'] as const
+  const SEVERITIES = [null, 'blocking', 'major', 'minor'] as const
+  // The colours of the status chips: the ground and the ink, for the light scheme and then the dark one. The dark
+  // grounds are opaque: the translucent colours of the dashboard over its dark pane (#262624).
+  const TONES: Record<IssueStatus, string[]> = {
+    open: ['#fde6dc', '#8a3a1a', '#493d35', '#ffc8ae'],
+    in_progress: ['#fbf0cf', '#6b5210', '#474235', '#f6dc9c'],
+    in_review: ['#d9f2ed', '#0f5c52', '#33403c', '#9ae8da'],
+    done: ['#ebe7f6', '#4c4570', '#3a383d', '#d3ccf0'],
+    wont_fix: ['#ebe7f6', '#4c4570', '#3a383d', '#d3ccf0'],
+    closed: ['#ebe7f6', '#4c4570', '#3a383d', '#d3ccf0'],
+  }
+  const everyPicture = (): Picture[] => [
+    ...STATUSES.map(status => statusChipSvg(status)),
+    ...TYPES.flatMap(type => SEVERITIES.flatMap(severity => metaSvg({ number: 12, type, severity }) ?? [])),
+    ...SECTION_LABELS.map(label => sectionLabelSvg(label)),
+  ]
+
+  test('draws a status chip with the word of the status on the colours of Tuix', () => {
+    for (const status of STATUSES) {
+      const chip = statusChipSvg(status)
+      const [bg, ink, darkBg, darkInk] = TONES[status]!
+
+      expect(chip.alt).toBe(STATUS_LABEL[status])
+      expect(wordsDrawn(chip.source)).toBe(STATUS_LABEL[status])
+      expect(chip.height).toBe(20)
+      expect(chip.width).toBeGreaterThan(40)
+
+      // The light palette is the default and on the shapes; the dark one is under the media query.
+      const [light = '', dark = ''] = chip.source.split('@media (prefers-color-scheme:dark)')
+
+      for (const colour of [bg, ink]) expect(light).toContain(colour)
+      for (const colour of [darkBg, darkInk]) expect(dark).toContain(colour)
+      expect(chip.source).toContain(`<rect class="bg" fill="${bg}"`)
+      expect(chip.source).toContain(`<text class="ink" fill="${ink}"`)
+    }
+  })
+
+  test('draws the meta line with the number, the type and the severity as fixed words', () => {
+    expect(metaSvg({ number: 12, type: 'bug', severity: 'blocking' })).toMatchObject({ alt: '#12, Bug, Blocking', height: 16 })
+    expect(wordsDrawn(metaSvg({ number: 12, type: 'bug', severity: 'blocking' })!.source)).toBe('#12 · BUG · BLOCKING')
+    expect(wordsDrawn(metaSvg({ number: 3, type: 'ux', severity: null })!.source)).toBe('#3 · UX')
+    expect(wordsDrawn(metaSvg({ number: 3, type: null, severity: 'minor' })!.source)).toBe('#3 · MINOR')
+    expect(wordsDrawn(metaSvg({ number: 3, type: null, severity: null })!.source)).toBe('#3')
+    expect(metaSvg({ number: 3, type: 'question', severity: 'major' })?.alt).toBe('#3, Question, Major')
+    expect(metaSvg({ number: 3, type: 'idea', severity: null })?.alt).toBe('#3, Idea')
+
+    // The number is in muted ink and the words are in peach text.
+    const meta = metaSvg({ number: 12, type: 'bug', severity: 'blocking' })!.source
+
+    expect(meta).toContain('<tspan class="m" fill="#726a9b">#12</tspan>')
+    expect(meta).toContain('<tspan class="p" fill="#b84f23">BUG</tspan>')
+    expect(meta).toContain('.p{fill:#b84f23}')
+    expect(meta).toContain('.p{fill:#d06a42}')
+    expect(meta).toContain('.m{fill:#8e86b4}')
+  })
+
+  test('takes a number that is no number, and a word that is no word of Tuix, for nothing', () => {
+    for (const number of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(metaSvg({ number, type: null, severity: null })).toBeUndefined()
+      expect(metaSvg({ number, type: 'bug', severity: null })?.alt).toBe('Bug')
+    }
+
+    const hostile = metaSvg({
+      number: 7,
+      type: '<script>alert(1)</script>' as never,
+      severity: '"><image href="x" onerror="alert(1)"/>' as never,
+    })!
+
+    expect(hostile.alt).toBe('#7')
+    expect(wordsDrawn(hostile.source)).toBe('#7')
+    expect(hostile.source).not.toMatch(/script|image|onerror|alert|href/)
+
+    const label = sectionLabelSvg('<svg onload=alert(1)>' as SectionLabel)
+    const chip = statusChipSvg('"><script>alert(1)</script>' as IssueStatus)
+
+    expect(label.alt).toBe('')
+    expect(label.source).not.toMatch(/script|onload|alert|<svg onload/)
+    expect(chip.alt).toBe('Open')
+    expect(chip.source).not.toMatch(/script|alert/)
+  })
+
+  test('writes the five characters of markup as entities', () => {
+    expect(escapeXml(`<a href="x">Tom & 'Jerry'</a>`)).toBe('&lt;a href=&quot;x&quot;&gt;Tom &amp; &#39;Jerry&#39;&lt;/a&gt;')
+    expect(escapeXml('plain words 12 · #')).toBe('plain words 12 · #')
+    // The apostrophe of Won't fix is a word of Tuix, and it is written as an entity.
+    expect(statusChipSvg('wont_fix').source).toContain('Won&#39;t fix</text>')
+    expect(statusChipSvg('wont_fix').alt).toBe("Won't fix")
+  })
+
+  test('draws a heading for each part of a report, in capitals, with the word as its alt', () => {
+    expect(SECTION_LABELS).toEqual(['Where', 'Element', 'Console and network', 'Console', 'Network', 'Screenshot', 'Screenshots', 'Comments', 'Activity'])
+
+    for (const label of SECTION_LABELS) {
+      const drawn = sectionLabelSvg(label)
+
+      expect(drawn.alt).toBe(label)
+      expect(wordsDrawn(drawn.source)).toBe(label.toUpperCase())
+      expect(drawn.source).toContain('fill="#726a9b"')
+      expect(drawn.source).toContain('.m{fill:#8e86b4}')
+    }
+  })
+
+  test('draws a screenshot as an image on a lavender box that names it, with a line round it and fixed words only', () => {
+    const base64 = 'AAAA'.repeat(2000)
+    const drawn = screenshotSvg({ jpegBase64: base64, width: 800, height: 500 })
+
+    expect(drawn?.alt).toBe(SCREENSHOT_ALT)
+    expect(SCREENSHOT_ALT).toBe('Screenshot of the reported page')
+    expect([drawn?.width, drawn?.height]).toEqual([800, 500])
+
+    const source = drawn?.source ?? ''
+    const bare = source.replace(base64, '')
+
+    expect(source.startsWith('<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500">')).toBe(true)
+    expect(source.length).toBeLessThan(131_072)
+    // One image, as a data URI of the checked base64 and nothing else; the clip rounds it (10 px at the width of the pane).
+    expect(source.split('<image ').length).toBe(2)
+    expect(source).toContain(`<image href="data:image/jpeg;base64,${base64}" x="0" y="0" width="800" height="500" preserveAspectRatio="none"/>`)
+    expect(source).toContain('<clipPath id="c"><rect width="800" height="500" rx="19"/></clipPath>')
+    // The box behind it is lavender with the word Screenshot, in the light colours on the shapes and the dark ones under the media query.
+    expect(source).toContain('<rect class="f" fill="#ebe7f6" width="800" height="500"/>')
+    expect(wordsDrawn(bare)).toBe('Screenshot')
+    expect(source).toContain('.f{fill:#ebe7f6}')
+    expect(source).toContain('@media (prefers-color-scheme:dark){.f{fill:#3a383d}')
+    // A line of 1 px at that width, light and dark.
+    expect(source).toContain('<rect class="b" fill="none" stroke="#d6cfea" stroke-width="1.9"')
+    expect(source).toContain('.b{stroke:#d6cfea}')
+    expect(source).toContain('.b{stroke:#453b70}')
+    // No script, no link, no address: the only href is the data URI.
+    expect(source.replace('xmlns="http://www.w3.org/2000/svg"', '')).not.toMatch(/<script|onload|xlink|https?:/)
+    expect([...source.matchAll(/href=/g)]).toHaveLength(1)
+
+    // A small copy gets a small radius.
+    const small = screenshotSvg({ jpegBase64: 'AAAA', width: 300, height: 200 })
+
+    expect(small?.source).toContain('<clipPath id="c"><rect width="300" height="200" rx="10"/></clipPath>')
+  })
+
+  test('draws the one word Screenshot on the box of a screenshot, and no other, whatever the size or the data', () => {
+    // The function takes no label: the word is fixed, so no text of a report can get into it.
+    expect(screenshotSvg.length).toBe(1)
+
+    for (const [jpegBase64, width, height] of [['AAAA', 300, 200], ['AAAA'.repeat(2000), 800, 500], ['AAAA', 320, 2000]] as const) {
+      const drawn = screenshotSvg({ jpegBase64, width, height })!
+      const bare = drawn.source.replace(jpegBase64, '')
+
+      expect(wordsDrawn(bare)).toBe('Screenshot')
+      expect([...bare.matchAll(/<text\b/g)]).toHaveLength(1)
+      expect(bare).toContain('>Screenshot</text>')
+      expect(drawn.alt).toBe(SCREENSHOT_ALT)
+    }
+
+    // A caller that passes a second argument anyway, as the old signature took, gets nothing of it in the markup.
+    const extra = (screenshotSvg as unknown as (thumb: unknown, label: string) => Picture | undefined)({ jpegBase64: 'AAAA', width: 300, height: 200 }, '<b>"Pay & go"</b>')
+
+    expect(extra?.source).not.toContain('Pay')
+    expect(extra?.source).not.toContain('<b>')
+    expect(extra?.source).not.toContain('&amp;')
+    expect(wordsDrawn(extra?.source.replace('AAAA', '') ?? '')).toBe('Screenshot')
+  })
+
+  test('draws no screenshot from what is not a base64 JPEG of a size, or what would pass the limit of an Svg', () => {
+    const make = (jpegBase64: string, width = 800, height = 500) => screenshotSvg({ jpegBase64, width, height })
+
+    expect(make('AAAA')).toBeDefined()
+    expect(make('')).toBeUndefined()
+    expect(make('AA"><script>alert(1)</script>')).toBeUndefined()
+    expect(make('AAAA" onload="x')).toBeUndefined()
+    expect(make('AAAA ')).toBeUndefined()
+    expect(make('AAAA', 0, 500)).toBeUndefined()
+    expect(make('AAAA', 800.5, 500)).toBeUndefined()
+    expect(make('AAAA', 800, Number.NaN)).toBeUndefined()
+    expect(make('AAAA', 5000, 500)).toBeUndefined()
+    expect(make('AAAA', -800, 500)).toBeUndefined()
+    // The engine refuses a whole pane for an Svg of more than 131,072 characters, so the drawing says no first.
+    expect(make('A'.repeat(125_000))?.source.length).toBeLessThanOrEqual(131_072)
+    expect(make('A'.repeat(131_000))).toBeUndefined()
+  })
+
+  test('draws the dot of the wordmark: a peach dot with a glow, one colour in both schemes, and no text', () => {
+    const dot = wordmarkDotSvg()
+
+    expect(dot.alt).toBe('dot')
+    expect([dot.width, dot.height]).toEqual([12, 14])
+    expect(dot.source).toMatch(/^<svg xmlns="http:\/\/www.w3.org\/2000\/svg" width="12" height="14" viewBox="0 0 12 14">/)
+    expect(wordsDrawn(dot.source)).toBe('')
+    expect(dot.source).not.toContain('<text')
+    expect(dot.source).toContain('<radialGradient id="glow">')
+    expect(dot.source).toContain('<circle cx="5" cy="6.5" r="2.1" fill="#f0906a"/>')
+    expect(dot.source).toContain('fill="url(#glow) none"')
+    // The same peach in the dot and the glow, and no rule for a scheme: nothing in it depends on the pane.
+    expect([...dot.source.matchAll(/(?:stop-color|fill)="(#[0-9a-f]{6})"/g)].map(one => one[1])).toEqual([...Array(5)].map(() => '#f0906a'))
+    expect(dot.source).not.toMatch(/<style|prefers-color-scheme|#ffb38f/)
+    expect(dot.source).not.toMatch(/<(?:script|image|foreignObject)|onload|onerror|javascript|href/i)
+    expect(dot.source.length).toBeLessThan(900)
+  })
+
+  test('gives every picture a light default, a dark block, a size that matches, and no script', () => {
+    const locator = locatorSvg({ box: { x: 1, y: 2, width: 3, height: 4 }, viewport: { width: 100, height: 100 }, scroll: null })!
+    const dot = wordmarkDotSvg()
+
+    // The dot has one colour in both schemes, so it has no style; it is the rest of this test otherwise.
+    expect(dot.source).toMatch(new RegExp(`^<svg xmlns="http://www.w3.org/2000/svg" width="${dot.width}" height="${dot.height}" viewBox="0 0 ${dot.width} ${dot.height}">`))
+    expect(dot.source).toMatch(/ fill="#[0-9a-f]{6}"/)
+
+    for (const drawn of [...everyPicture(), locator]) {
+      expect(drawn.source.length).toBeLessThan(131_072)
+      expect(drawn.source.length).toBeLessThan(3000)
+      expect(drawn.source).toMatch(new RegExp(`^<svg xmlns="http://www.w3.org/2000/svg" width="${drawn.width}" height="${drawn.height}" `))
+      expect(drawn.source).toContain(`viewBox="0 0 ${drawn.width} ${drawn.height}"`)
+      expect(drawn.source).toMatch(/<style>[^<]*\{fill:#[0-9a-f]{6}[^<]*@media \(prefers-color-scheme:dark\)\{[^<]*\}\}<\/style>/)
+      // The light colour is on a shape too, for a surface that drops the <style>.
+      expect(drawn.source).toMatch(/ fill="#[0-9a-f]{6}"/)
+      expect(drawn.source).not.toMatch(/<(?:script|image|foreignObject)|onload|onerror|javascript|href/i)
+      expect(drawn.alt).not.toBe('')
+    }
+  })
+
+  describe('on a light pane and a dark one, in both colour schemes', () => {
+    // The panes of Claude Desktop, and the least contrast a text colour has on each if it has no ground of its own.
+    const PANES = ['#faf9f5', '#262624'] as const
+    const MINIMUM = 2.8
+    // The least contrast of text on a ground of the picture's own.
+    const ON_GROUND = 4.5
+
+    // The WCAG contrast of two colours, #rrggbb: 1 to 21.
+    const luminance = (colour: string) => {
+      const [r = 0, g = 0, b = 0] = [1, 3, 5].map(at => {
+        const value = Number.parseInt(colour.slice(at, at + 2), 16) / 255
+
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+      })
+
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+    const contrast = (a: string, b: string) => {
+      const [light = 0, dark = 0] = [luminance(a), luminance(b)].sort((x, y) => y - x)
+
+      return (light + 0.05) / (dark + 0.05)
+    }
+
+    type Scheme = 'light' | 'dark'
+
+    // The fill rules of the style of a picture for each scheme: `.name{fill:#...}`, the dark ones under the media query.
+    const rulesOf = (source: string): Record<Scheme, Map<string, string>> => {
+      const style = /<style>(.*?)<\/style>/s.exec(source)?.[1] ?? ''
+      const [light = '', dark = ''] = style.split('@media (prefers-color-scheme:dark){')
+      const fills = (css: string) => new Map([...css.matchAll(/\.([a-z]+)\{fill:([^;}]+)/g)].map(one => [one[1]!, one[2]!] as const))
+
+      return { light: fills(light), dark: fills(dark) }
+    }
+    const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1]
+
+    // The fill an element has in a scheme: the rule of its class in the dark one if it has any, else the rule of the
+    // light one, else the attribute that every shape carries.
+    const fillIn = (scheme: Scheme, tag: string, rules: Record<Scheme, Map<string, string>>) => {
+      const name = attr(tag, 'class')
+      const own = attr(tag, 'fill')
+      const light = (name === undefined ? undefined : rules.light.get(name)) ?? own
+
+      return scheme === 'light' ? light : ((name === undefined ? undefined : rules.dark.get(name)) ?? light)
+    }
+
+    // Every colour a text of the picture has in each scheme, with the opaque ground of the same size under it, if any.
+    const textsOf = (drawn: Picture) => {
+      const rules = rulesOf(drawn.source)
+      const tags = [...drawn.source.matchAll(/<(?:text|tspan)\b[^>]*>/g)].map(one => one[0])
+      const grounds = [...drawn.source.matchAll(/<rect\b[^>]*>/g)]
+        .map(one => one[0])
+        .filter(tag => attr(tag, 'width') === String(drawn.width) && attr(tag, 'height') === String(drawn.height))
+
+      return (['light', 'dark'] as const).flatMap(scheme =>
+        tags.flatMap(tag => {
+          const fill = fillIn(scheme, tag, rules)
+
+          // The mono lines carry their colours on the spans, not on the text element.
+          if (fill === undefined) return []
+
+          const ground = grounds.map(one => fillIn(scheme, one, rules)).find(colour => colour !== undefined && /^#[0-9a-f]{6}$/.test(colour))
+
+          return [{ scheme, fill, ground }]
+        }),
+      )
+    }
+
+    const pictures = (): Record<string, Picture[]> => ({
+      chips: Object.keys(STATUS_LABEL).map(status => statusChipSvg(status as IssueStatus)),
+      metas: TYPES.flatMap(type => SEVERITIES.flatMap(severity => metaSvg({ number: 12, type, severity }) ?? [])),
+      sections: SECTION_LABELS.map(label => sectionLabelSvg(label)),
+      screenshot: [screenshotSvg({ jpegBase64: 'AAAA', width: 800, height: 500 })!],
+      dot: [wordmarkDotSvg()],
+      locator: [locatorSvg({ box: { x: 120, y: 1300, width: 200, height: 40 }, viewport: { width: 1280, height: 720 }, scroll: { x: 0, y: 1000 } })!],
+    })
+
+    test('reads the contrast of two colours as WCAG does', () => {
+      expect(Math.abs(contrast('#000000', '#ffffff') - 21) < 1e-6).toBe(true)
+      expect(contrast('#ffffff', '#ffffff')).toBe(1)
+      expect(contrast('#767676', '#ffffff')).toBeGreaterThan(4.5)
+      expect(contrast('#777777', '#ffffff')).toBeLessThan(4.5)
+    })
+
+    test('gives every text colour of every picture at least 2.8:1 on both panes, or a ground of its own at 4.5:1', () => {
+      const found: Record<string, number> = {}
+
+      for (const [name, list] of Object.entries(pictures())) {
+        for (const drawn of list) {
+          for (const { scheme, fill, ground } of textsOf(drawn)) {
+            const onPanes = PANES.every(pane => contrast(fill, pane) >= MINIMUM)
+            const onGround = ground !== undefined && contrast(fill, ground) >= ON_GROUND
+
+            found[name] = (found[name] ?? 0) + 1
+
+            if (!onPanes && !onGround) {
+              throw new Error(`${name} (${drawn.alt}), ${scheme} scheme: ${fill} is ${PANES.map(pane => contrast(fill, pane).toFixed(2)).join(' and ')} on the panes, ${ground === undefined ? 'with no ground' : `${contrast(fill, ground).toFixed(2)} on ${ground}`}`)
+            }
+          }
+        }
+      }
+
+      // The test finds the text it is about: a change of markup that hid it from the test would pass it for nothing.
+      expect(found.chips).toBe(12)
+      expect(found.metas).toBeGreaterThan(40)
+      expect(found.sections).toBe(SECTION_LABELS.length * 2)
+      expect(found.screenshot).toBe(2)
+      expect(found.dot ?? 0).toBe(0)
+      expect(found.locator ?? 0).toBe(0)
+    })
+
+    test('has the text of a chip on an opaque ground of its own in the dark scheme too, so the chip is the same on either pane', () => {
+      for (const status of Object.keys(STATUS_LABEL) as IssueStatus[]) {
+        const chip = statusChipSvg(status)
+        const texts = textsOf(chip)
+        const [light, dark] = [texts.find(one => one.scheme === 'light'), texts.find(one => one.scheme === 'dark')]
+
+        expect(light?.ground).toMatch(/^#[0-9a-f]{6}$/)
+        expect(dark?.ground).toMatch(/^#[0-9a-f]{6}$/)
+        expect(contrast(light!.fill, light!.ground!)).toBeGreaterThanOrEqual(ON_GROUND)
+        expect(contrast(dark!.fill, dark!.ground!)).toBeGreaterThanOrEqual(ON_GROUND)
+      }
+    })
+
+    test('holds no translucent colour as a ground, and only the colours of Tuix in the text', () => {
+      for (const list of Object.values(pictures())) {
+        for (const drawn of list) {
+          expect(drawn.source).not.toMatch(/rgba?\(/)
+          expect(drawn.source).not.toContain('#5d5680')
+          expect(drawn.source).not.toContain('#b2a9d6')
+          expect(drawn.source).not.toContain('#ffb38f')
+        }
+      }
+    })
+
+    test('has a dark muted lavender and a dark peach text that read on a light pane as well', () => {
+      expect(contrast('#8e86b4', PANES[0])).toBeGreaterThanOrEqual(MINIMUM)
+      expect(contrast('#8e86b4', PANES[1])).toBeGreaterThanOrEqual(MINIMUM)
+      expect(contrast('#d06a42', PANES[0])).toBeGreaterThanOrEqual(MINIMUM)
+      expect(contrast('#d06a42', PANES[1])).toBeGreaterThanOrEqual(MINIMUM)
+      // And the light ones read on a dark pane, which a light scheme on a dark pane shows.
+      expect(contrast('#726a9b', PANES[1])).toBeGreaterThanOrEqual(MINIMUM)
+      expect(contrast('#b84f23', PANES[1])).toBeGreaterThanOrEqual(MINIMUM)
+      expect(contrast('#726a9b', PANES[0])).toBeGreaterThanOrEqual(ON_GROUND)
+      expect(contrast('#b84f23', PANES[0])).toBeGreaterThanOrEqual(ON_GROUND)
+    })
+  })
+
+  test('holds only the words of Tuix in the text of its pictures', () => {
+    for (const drawn of everyPicture()) {
+      expect(isFixedWords(wordsDrawn(drawn.source))).toBe(true)
+    }
+
+    expect(isFixedWords('Pay button does nothing')).toBe(false)
+    expect(isFixedWords('#12 · BUG · BLOCKING · EXTRA')).toBe(false)
+  })
+})
+
 describe('desktop', () => {
   test('draws the issues as cards and fixes one from its card', async ($, on) => {
     const seen = world(on)
@@ -1014,6 +1489,139 @@ describe('desktop', () => {
     await seen.clock.advance(1)
 
     expect(seen.submitted[0]).toContain('Checkout #7')
+    await ui.unmount()
+  })
+
+  // The element with this key in the tree a mounted pane drew.
+  const nodeOf = async (ui: Pick<Mounted, 'drawn'>, key: string) =>
+    elementsOf(await ui.drawn()).find(one => one.props?.key === key)
+
+  test('draws the wordmark first in the header, and each card with its chip, its meta line and its title', async ($, on) => {
+    world(on)
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+    const alts = (await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)
+
+    // The header, then the cards in the order of the list: the most severe first.
+    expect(alts).toEqual(['dot', 'Open', '#9, Bug, Blocking', 'Open', '#7, UX, Minor'])
+
+    // The wordmark is the word in bold Text, which takes the ink of the pane, and the dot beside it as a picture.
+    const word = await ui.find({ type: 'Text', text: 'tuix' })
+    const row = elementsOf(await ui.drawn()).find(
+      node => node.type === 'Box' && node.props?.alignItems === 'flex-end' && JSON.stringify(node.children).includes('"tuix"'),
+    )
+
+    expect(word?.props).toMatchObject({ bold: true })
+    expect(row?.props).toMatchObject({ flexDirection: 'row', alignItems: 'flex-end' })
+    expect((row?.children ?? []).map(child => (isDrawn(child) ? child.type : child))).toEqual(['Text', 'Svg'])
+
+    const title = await ui.find({ type: 'Text', text: 'Pay button does nothing' })
+
+    expect(title?.props).toMatchObject({ bold: true, wrap: 'wrap' })
+    expect(await ui.find({ type: 'Text', text: '2d ago' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '/pay · production · by Bo' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '2 open in Checkout' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Checkout #9/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('turns the border of a card peach under the pointer', async ($, on) => {
+    world(on)
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+    const card = await nodeOf(ui, 'card-i9')
+
+    expect(card?.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle' })
+    expect(card?.hover).toEqual({ borderColor: '#f0906a' })
+    await ui.unmount()
+  })
+
+  test('keeps a Details button and a bold title where the engine refuses a Button that holds Text', async ($, on) => {
+    const seen = world(on, { base: '2.1.286' })
+    await begin($)
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+
+    // The tree validates on every engine from 2.1.286: the hover is kept, and the title is no Button.
+    expect((await ui.find({ key: 'issue-i9' }))?.props).toMatchObject({ label: 'Details' })
+    expect((await nodeOf(ui, 'card-i9'))?.hover).toEqual({ borderColor: '#f0906a' })
+    expect(await ui.find({ type: 'Text', text: 'Pay button does nothing' })).toBeDefined()
+    expect((await ui.find({ key: 'fix-i9' }))?.props).toMatchObject({ label: 'Fix with Claude' })
+
+    await ui.press({ key: 'issue-i9' })
+    await seen.clock.advance(1)
+
+    expect(seen.calls.filter(call => call.tool === 'get_issue')).toHaveLength(1)
+    expect((await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)).toContain('Where')
+    await ui.unmount()
+  })
+
+  test('makes the title the press that opens the report on an engine that draws a Button that holds Text', async ($, on) => {
+    const seen = world(on)
+
+    // An older engine refuses the tree, so only a newer one runs the rest.
+    if (!(await drawsTextButtons($, on))) return
+
+    await begin($)
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+    const button = await nodeOf(ui, 'issue-i9')
+
+    expect(button?.type).toBe('Button')
+    // The engine names the button by its text: it is the title, a word of the report, and it is drawn as the text of the button.
+    expect(button?.props).toMatchObject({ plain: true, label: 'Pay button does nothing' })
+    expect(button?.children).toEqual([{ type: 'Text', props: { bold: true, wrap: 'wrap' }, children: ['Pay button does nothing'] }])
+    expect(await ui.find({ type: 'Button', text: 'Details' })).toBeUndefined()
+    expect((await ui.find({ key: 'fix-i7' }))?.props).toMatchObject({ label: 'Fix with Claude' })
+
+    // The press opens the report as Details did, and Fix with Claude still asks Claude.
+    await ui.press({ key: 'issue-i9' })
+    await seen.clock.advance(1)
+
+    expect(seen.calls.filter(call => call.tool === 'get_issue')).toHaveLength(1)
+    expect((await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)).toContain('Where')
+    await ui.press({ key: 'back' })
+    await ui.press({ key: 'fix-i7' })
+    await seen.clock.advance(1)
+
+    expect(seen.submitted[0]).toContain('Checkout #7')
+    await ui.unmount()
+  })
+
+  test('says in a short line that a list is empty', async ($, on) => {
+    world(on, { issues: reply({ issues: [], next_cursor: null }) })
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+
+    expect(await ui.find({ type: 'Text', text: 'No open issues in Checkout.' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Nothing here.' })).toBeUndefined()
+    await ui.press({ key: 'refresh' })
+    await ui.unmount()
+
+    const terminal = await pane($, 'terminal')
+
+    expect(await terminal.find({ type: 'Text', text: 'Nothing here.' })).toBeDefined()
+    await terminal.unmount()
+  })
+
+  test('draws the chip and the meta line in the header of a report, and a card for each comment', async ($, on) => {
+    const seen = world(on)
+    await tuix($, 'list')
+    const ui = await pane($, 'desktop')
+
+    await ui.press({ key: 'issue-i9' })
+    await seen.clock.advance(1)
+
+    const alts = (await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)
+
+    expect(alts.slice(0, 2)).toEqual(['Open', '#9, Bug, Blocking'])
+    expect(alts).not.toContain('dot')
+    expect(await ui.find({ type: 'Text', text: 'Pay button does nothing' })).toBeDefined()
+
+    for (const id of ['c1', 'c2']) {
+      expect((await nodeOf(ui, `comment-${id}`))?.props).toMatchObject({ borderStyle: 'round', borderColor: 'subtle' })
+    }
+
     await ui.unmount()
   })
 
@@ -1070,6 +1678,20 @@ describe('desktop', () => {
     expect(await one.find({ key: 'card-i9' })).toBeDefined()
     expect(await one.find({ key: 'card-i7' })).toBeUndefined()
     await one.unmount()
+  })
+
+  test('draws a card of a row with its chip, its meta line and a bold title that is no button', async ($, on) => {
+    world(on)
+    await begin($)
+    const ui = await mountRow($, 'mcp__Tuix__list_issues')
+    const alts = (await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)
+
+    expect(alts).toEqual(['Open', '#9, Bug, Blocking', 'Open', '#7, UX, Minor'])
+    expect((await ui.find({ type: 'Text', text: 'Pay button does nothing' }))?.props).toMatchObject({ bold: true })
+    expect(await ui.find({ key: 'issue-i9' })).toBeUndefined()
+    expect(await ui.find({ key: 'fix-i9' })).toBeUndefined()
+    expect(elementsOf(await ui.drawn()).find(one => one.props?.key === 'card-i9')?.hover).toEqual({ borderColor: '#f0906a' })
+    await ui.unmount()
   })
 
   test('leaves the rows of other tools, and every row in the terminal, to Claude Code', async ($, on) => {
@@ -1826,7 +2448,7 @@ describe('permissions', () => {
 })
 
 // A node of a drawn tree, as `ui.drawn()` gives it.
-type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+type Drawn = { type: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
 
 const isDrawn = (value: unknown): value is Drawn => typeof value === 'object' && value !== null && 'type' in value
 
@@ -1861,6 +2483,16 @@ describe('the report of an issue', () => {
   // The Text with exactly this text, or one that matches the pattern. A string given to find is a part of the text.
   const text = async (ui: Pick<Mounted, 'findAll'>, value: string | RegExp) =>
     (await ui.findAll({ type: 'Text', text: value })).find(one => typeof value !== 'string' || one.text === value)
+  // The heading of a part: a Text on the terminal. The Desktop app draws the word as a picture with the word as its alt,
+  // and the count of the comments, `(2)`, in a Text beside it.
+  const heading = async (ui: Pick<Mounted, 'findAll'>, title: string) => {
+    const [word = '', count] = title.split(/ (?=\()/)
+    const picture = (await ui.findAll({ type: 'Svg' })).find(one => one.props.alt === word)
+
+    if (picture === undefined) return text(ui, title)
+
+    return count === undefined || (await text(ui, count)) !== undefined ? picture : undefined
+  }
   const NOTE = 'Error: result (60,010 characters across 1 line) exceeds maximum allowed tokens. Output has been saved to /tmp/tool-results/1.json'
   const tooLarge = (): McpToolResult => ({ content: [{ type: 'text', text: NOTE.padEnd(60_010, ' ') }], isError: false })
   const refusal = (message: string): McpToolResult => ({
@@ -2065,12 +2697,16 @@ describe('the report of an issue', () => {
       const drawn = locatorSvg(input)
 
       expect(drawn).toMatchObject({ alt: LOCATOR_ALT, width: 240 })
-      expect(drawn?.source).toMatch(/^<svg [^>]*>(?:<rect [^>]*\/>|<circle [^>]*\/>)+<\/svg>$/)
+      expect(drawn?.source).toMatch(/^<svg [^>]*><style>[^<]*<\/style>(?:<rect [^>]*\/>|<circle [^>]*\/>)+<\/svg>$/)
       expect(drawn?.source).not.toContain('<text')
       expect(drawn?.source.length).toBeLessThan(2000)
       // The element at 120, 300 in the window is inside: its box and a dot are drawn.
       expect(drawn?.source.match(/<rect /g)).toHaveLength(4)
-      expect(drawn?.source).toContain('<circle cx="44.4" cy="61" r="3.5" fill="#dc2626"')
+      expect(drawn?.source).toContain('<circle cx="44.4" cy="61" r="3.5" fill="#f0906a"')
+      // The peach is one colour in both schemes, so only the lavender has a rule for the dark one.
+      expect(drawn?.source).toContain('.w{fill:#8e86b4;stroke:#7b70a8}')
+      expect(drawn?.source).toContain('.t{fill:#8e86b4}')
+      expect(drawn?.source).not.toContain('#ffb38f')
       expect(locatorText(input)).toBe('Window 1280 x 720. Scrolled 0, 1000. Element 200 x 40 at 120, 300 in the window.')
     })
 
@@ -2183,8 +2819,12 @@ describe('the report of an issue', () => {
         expect(reads(seen)[0]?.args).toEqual({ id: 'i9', limit: 20, include: [...REPORT_SECTIONS] })
 
         for (const title of ['Where', 'Element', 'Console', 'Network', 'Screenshots', 'Comments (2)', 'Activity']) {
-          expect(await text(ui, title)).toBeDefined()
+          expect(await heading(ui, title)).toBeDefined()
         }
+
+        // The Desktop app has a part for the screenshot too, with a button, since no rule allows the read.
+        expect((await heading(ui, 'Screenshot')) !== undefined).toBe(surface === 'desktop')
+        expect((await ui.find({ key: 'thumb-show' })) !== undefined).toBe(surface === 'desktop')
 
         const sources = (await ui.findAll({ type: 'Code' })).map(one => one.props.source)
 
@@ -2205,7 +2845,8 @@ describe('the report of an issue', () => {
         expect(await text(ui, /assigned to Maja/)).toBeDefined()
         expect((await ui.find({ key: 'shot-s1' }))?.props).toMatchObject({ label: 'Open screenshot' })
 
-        // The Desktop app draws the locator as a picture. The terminal has the numbers only.
+        // The locator picture shows until a picture of the screenshot is ready: here no rule lets the mod read it
+        // yet, so the Desktop app has the locator and the button. The terminal has the numbers only.
         const alts = (await ui.findAll({ type: 'Svg' })).map(one => one.props.alt)
 
         expect(alts.includes(LOCATOR_ALT)).toBe(surface === 'desktop')
@@ -2226,7 +2867,7 @@ describe('the report of an issue', () => {
     }
 
     test('draws the locator picture with numbers and not one word of the fixture', async ($, on) => {
-      const seen = world(on)
+      const seen = world(on, { report: args => reportOf('i9', args, { ...CONTEXT, screenshots: [] }) })
       const ui = await open($, seen, 'desktop')
       const locators = (await ui.findAll({ type: 'Svg' })).filter(one => one.props.alt === LOCATOR_ALT)
       const words = [...wordsOf(CONTEXT), ...wordsOf(ISSUES), ...wordsOf(COMMENTS)]
@@ -2403,9 +3044,9 @@ describe('the report of an issue', () => {
 
       expect(reads(seen)).toHaveLength(2)
       expect(await text(ui, 'The console and network entries are too large for the pane: open in Tuix.')).toBeDefined()
-      expect(await text(ui, 'Console')).toBeUndefined()
-      expect(await text(ui, 'Element')).toBeDefined()
-      expect(await text(ui, 'Comments (2)')).toBeDefined()
+      expect(await heading(ui, 'Console')).toBeUndefined()
+      expect(await heading(ui, 'Element')).toBeDefined()
+      expect(await heading(ui, 'Comments (2)')).toBeDefined()
       expect(await text(ui, /too large for the pane: open in Tuix\.$/)).toBeDefined()
       await ui.unmount()
     })
@@ -2418,8 +3059,8 @@ describe('the report of an issue', () => {
         { id: 'i9', limit: 20, include: [...REPORT_SECTIONS] },
         { id: 'i9', limit: 20 },
       ])
-      expect(await text(ui, 'Where')).toBeDefined()
-      expect(await text(ui, 'Comments (2)')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeDefined()
+      expect(await heading(ui, 'Comments (2)')).toBeDefined()
       // A full-scope connection has its context, so there is nothing to explain.
       expect(await text(ui, SCOPE_HINT)).toBeUndefined()
       expect(await text(ui, TEXT_ONLY_HINT)).toBeUndefined()
@@ -2462,7 +3103,7 @@ describe('the report of an issue', () => {
         { id: 'i9', limit: 20, include: [...REPORT_SECTIONS] },
         { id: 'i9', limit: 20 },
       ])
-      expect(await text(ui, 'Comments (2)')).toBeDefined()
+      expect(await heading(ui, 'Comments (2)')).toBeDefined()
       expect(await text(ui, 'Tuix: the call failed')).toBeUndefined()
       // This server cannot send more, and no setting of the project changes that.
       expect(await text(ui, TEXT_ONLY_HINT)).toBeDefined()
@@ -2489,7 +3130,7 @@ describe('the report of an issue', () => {
         { id: 'i9', limit: 20, include: [...REPORT_SECTIONS] },
         { id: 'i9', limit: 20 },
       ])
-      expect(await text(ui, 'Comments (2)')).toBeDefined()
+      expect(await heading(ui, 'Comments (2)')).toBeDefined()
       expect(await text(ui, SCOPE_HINT)).toBeDefined()
       expect(await text(ui, TEXT_ONLY_HINT)).toBeUndefined()
 
@@ -2508,7 +3149,7 @@ describe('the report of an issue', () => {
       const ui = await open($, seen, 'terminal')
 
       expect(reads(seen)).toHaveLength(2)
-      expect(await text(ui, 'Where')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeDefined()
       await ui.unmount()
     })
 
@@ -2541,7 +3182,7 @@ describe('the report of an issue', () => {
         { id: 'i9', limit: 1 },
         { id: 'i9', limit: 20, cursor: 'more' },
       ])
-      expect(await text(ui, 'Comments (3)')).toBeDefined()
+      expect(await heading(ui, 'Comments (3)')).toBeDefined()
       expect((await ui.findAll({ type: 'Link' })).map(one => one.props.href)).toContain(SHOT_URL)
       await ui.unmount()
     })
@@ -2610,7 +3251,7 @@ describe('the report of an issue', () => {
 
         expect(reads(seen)).toHaveLength(1)
         expect(await text(ui, 'Reading the full report…')).toBeDefined()
-        expect(await text(ui, 'Where')).toBeUndefined()
+        expect(await heading(ui, 'Where')).toBeUndefined()
 
         // Details again does nothing while the read runs.
         await ui.press({ key: 'back' })
@@ -2623,13 +3264,13 @@ describe('the report of an issue', () => {
         await seen.clock.advance(1)
 
         expect(reads(seen)).toHaveLength(2)
-        expect(await text(ui, 'Where')).toBeDefined()
+        expect(await heading(ui, 'Where')).toBeDefined()
         expect(await text(ui, 'Reading the full report…')).toBeUndefined()
 
         // The first read ends late and does not write over the report.
         await seen.clock.advance(3_600_000)
 
-        expect(await text(ui, 'Where')).toBeDefined()
+        expect(await heading(ui, 'Where')).toBeDefined()
         expect(reads(seen)).toHaveLength(2)
         await ui.unmount()
       })
@@ -2647,7 +3288,7 @@ describe('the report of an issue', () => {
       await seen.clock.advance(1)
 
       expect(reads(seen)).toHaveLength(1)
-      expect(await text(ui, 'Where')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeDefined()
       await ui.unmount()
     })
 
@@ -2700,8 +3341,8 @@ describe('the report of an issue', () => {
       const ui = await open($, seen, 'desktop')
 
       expect(await text(ui, SCOPE_HINT)).toBeDefined()
-      expect(await text(ui, 'Where')).toBeUndefined()
-      expect(await text(ui, 'Comments (2)')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeUndefined()
+      expect(await heading(ui, 'Comments (2)')).toBeDefined()
       expect(SCOPE_HINT).toBe('Screenshots and diagnostics are off for this connection. A project admin can turn them on in Project settings > AI access.')
       await ui.unmount()
     })
@@ -2711,9 +3352,9 @@ describe('the report of an issue', () => {
       const ui = await open($, seen, 'desktop')
 
       expect(await text(ui, 'Console and network logs are visible to the reporter and project admins.')).toBeDefined()
-      expect(await text(ui, 'Console and network')).toBeDefined()
-      expect(await text(ui, 'Console')).toBeUndefined()
-      expect(await text(ui, 'Element')).toBeDefined()
+      expect(await heading(ui, 'Console and network')).toBeDefined()
+      expect(await heading(ui, 'Console')).toBeUndefined()
+      expect(await heading(ui, 'Element')).toBeDefined()
       await ui.unmount()
     })
 
@@ -2721,7 +3362,7 @@ describe('the report of an issue', () => {
       const seen = world(on, { report: args => reportOf('i9', args, { ...CONTEXT, console: [], network: [] }) })
       const ui = await open($, seen, 'desktop')
 
-      expect(await text(ui, 'Console')).toBeDefined()
+      expect(await heading(ui, 'Console')).toBeDefined()
       expect(await ui.findAll({ type: 'Text', text: 'No entries.' })).toHaveLength(2)
       await ui.unmount()
     })
@@ -2741,7 +3382,7 @@ describe('the report of an issue', () => {
       })
       const ui = await open($, seen, 'desktop')
 
-      expect(await text(ui, 'Comments (20+)')).toBeDefined()
+      expect(await heading(ui, 'Comments (20+)')).toBeDefined()
       expect(await ui.find({ key: 'comments-more' })).toBeDefined()
 
       await ui.press({ key: 'comments-more' })
@@ -2751,7 +3392,7 @@ describe('the report of an issue', () => {
       await seen.clock.advance(1)
 
       expect(reads(seen).at(-1)?.args).toEqual({ id: 'i9', limit: 20, cursor: '1', include: ['page'] })
-      expect(await text(ui, 'Comments (40+)')).toBeDefined()
+      expect(await heading(ui, 'Comments (40+)')).toBeDefined()
       expect(await text(ui, 'Comment 39')).toBeDefined()
       // MAX_COMMENTS is 40: the pane sends the person to Tuix for the rest.
       expect(MAX_COMMENTS).toBe(40)
@@ -2771,7 +3412,7 @@ describe('the report of an issue', () => {
       await seen.clock.advance(1)
 
       expect(await text(ui, 'Tuix: Tuix rejected the request parameters.')).toBeDefined()
-      expect(await text(ui, 'Comments (2+)')).toBeDefined()
+      expect(await heading(ui, 'Comments (2+)')).toBeDefined()
       expect(await ui.find({ key: 'comments-more' })).toBeDefined()
       await ui.unmount()
     })
@@ -2793,7 +3434,7 @@ describe('the report of an issue', () => {
         await seen.clock.advance(1)
 
         expect(await ui.find({ key: 'rule-0' })).toBeUndefined()
-        expect(await text(ui, 'Where')).toBeDefined()
+        expect(await heading(ui, 'Where')).toBeDefined()
         expect(reads(seen)).toHaveLength(2)
         await ui.unmount()
       })
@@ -2811,7 +3452,7 @@ describe('the report of an issue', () => {
       await ui.press({ key: 'retry' })
       await seen.clock.advance(1)
 
-      expect(await text(ui, 'Where')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeDefined()
       expect(await text(ui, 'Tuix: Something broke.')).toBeUndefined()
       await ui.unmount()
     })
@@ -2826,8 +3467,426 @@ describe('the report of an issue', () => {
       await seen.clock.advance(1)
 
       expect(await text(ui, 'Tuix: Something broke.')).toBeDefined()
-      expect(await text(ui, 'Where')).toBeDefined()
+      expect(await heading(ui, 'Where')).toBeDefined()
       await ui.unmount()
+    })
+  })
+
+  describe('the screenshot', () => {
+    const shotCalls = (seen: World) => seen.calls.filter(call => call.tool === 'get_screenshot')
+    const SHOT_WORDS = 'Getting the screenshot…'
+    // The Svg that holds the small copy, and the locator picture.
+    const picture = async (ui: Pick<Mounted, 'findAll'>) => (await ui.findAll({ type: 'Svg' })).find(one => one.props.alt === SCREENSHOT_ALT)
+    const locator = async (ui: Pick<Mounted, 'findAll'>) => (await ui.findAll({ type: 'Svg' })).find(one => one.props.alt === LOCATOR_ALT)
+    // Lets the read of the report and then the read of the screenshot run.
+    const settle = async (seen: World) => {
+      await seen.clock.advance(1)
+      await seen.clock.advance(1)
+    }
+
+    for (const base of ['2.1.286', '2.1.296']) {
+      test(`reads the screenshot on its own when a rule allows it, and draws it in place of the locator, on an engine of ${base}`, async ($, on) => {
+        const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix'), base })
+
+        await tuix($, 'list')
+
+        const ui = await pane($, 'desktop')
+
+        await ui.press({ key: 'issue-i9' })
+        await settle(seen)
+
+        expect(shotCalls(seen)).toHaveLength(1)
+        expect(shotCalls(seen)[0]).toMatchObject({ server: 'Tuix', args: { issue_id: 'i9', screenshot_id: 's1' } })
+
+        const drawn = await picture(ui)
+        const source = String(drawn?.props.source)
+
+        expect(drawn).toBeDefined()
+        expect(source.startsWith('<svg ')).toBe(true)
+        expect(source).toContain('<image href="data:image/jpeg;base64,')
+        expect(source.length).toBeLessThan(131_072)
+        // The part is headed Screenshot. The locator is gone, and the lines of Where stay.
+        expect(await heading(ui, 'Screenshot')).toBeDefined()
+        expect(await heading(ui, 'Where')).toBeDefined()
+        expect(await text(ui, 'Page: https://shop.example/pay?step=2')).toBeDefined()
+        expect(await locator(ui)).toBeUndefined()
+        expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+        expect(await text(ui, SHOT_WORDS)).toBeUndefined()
+
+        // Open screenshot is under the picture, and the list of screenshots has no second row for it.
+        const order = elementsOf(await ui.drawn())
+        const at = (match: (node: Drawn) => boolean) => order.findIndex(match)
+
+        expect(at(node => node.type === 'Svg' && node.props?.alt === SCREENSHOT_ALT)).toBeLessThan(at(node => node.props?.key === 'shot-s1'))
+        expect((await ui.findAll({ key: 'shot-s1' })).length).toBe(1)
+        expect(await heading(ui, 'Screenshots')).toBeUndefined()
+        expect(await text(ui, 'Original · 1280 x 720 · 178 KB · 2d ago')).toBeDefined()
+
+        // A second press on the issue, and Back, read nothing again. Reload reads the screenshot once more.
+        await ui.press({ key: 'back' })
+        await ui.press({ key: 'issue-i9' })
+        await settle(seen)
+
+        expect(shotCalls(seen)).toHaveLength(1)
+        expect(await picture(ui)).toBeDefined()
+
+        await ui.press({ key: 'reload' })
+        await settle(seen)
+
+        expect(shotCalls(seen)).toHaveLength(2)
+        expect(await picture(ui)).toBeDefined()
+        await ui.unmount()
+      })
+    }
+
+    test('shows no button while the report is read and the screenshot is read for, and says that it reads', async ($, on) => {
+      const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix') })
+
+      await tuix($, 'list')
+
+      const ui = await pane($, 'desktop')
+
+      await ui.press({ key: 'issue-i9' })
+      await seen.clock.advance(1)
+      await ui.redraw()
+
+      // The report is on screen and the screenshot is already read for: the words, and no button. The locator
+      // drawing stays until the picture of the screenshot is ready.
+      expect(await heading(ui, 'Element')).toBeDefined()
+      expect(await text(ui, SHOT_WORDS)).toBeDefined()
+      expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+      expect(await picture(ui)).toBeUndefined()
+      expect(await locator(ui)).toBeDefined()
+
+      await seen.clock.advance(1)
+
+      expect(await picture(ui)).toBeDefined()
+      expect(await locator(ui)).toBeUndefined()
+      expect(await text(ui, SHOT_WORDS)).toBeUndefined()
+      expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test('makes a button of the read where no rule allows it, and asks with the press', async ($, on) => {
+      const seen = world(on, { surfaces: ['desktop'] })
+      const ui = await open($, seen, 'desktop')
+
+      expect(shotCalls(seen)).toHaveLength(0)
+      expect(await ui.find({ key: 'thumb-show' })).toMatchObject({ props: { label: 'Show screenshot' } })
+      expect(await picture(ui)).toBeUndefined()
+      // The part says nothing else, and the list keeps its row for the screenshot.
+      expect(await ui.find({ key: 'shot-s1' })).toBeDefined()
+      // With no rule there is no picture yet, so the drawing of where the element was shows, with its lines and numbers.
+      expect(await locator(ui)).toBeDefined()
+      expect(await text(ui, 'Window 1280 x 720. Scrolled 0, 1000. Element 200 x 40 at 120, 300 in the window.')).toBeDefined()
+
+      await ui.press({ key: 'thumb-show' })
+
+      expect(await text(ui, SHOT_WORDS)).toBeDefined()
+      // It stays while the screenshot is read, and goes when the picture is ready.
+      expect(await locator(ui)).toBeDefined()
+
+      await settle(seen)
+
+      expect(shotCalls(seen)).toHaveLength(1)
+      expect(await picture(ui)).toBeDefined()
+      expect(await locator(ui)).toBeUndefined()
+      expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test('starts the copy of a screenshot on its own only when it has not tried, or on Reload; a read that died is read by the button', () => {
+      const ready = { phase: 'ready' as const, source: '<svg/>', width: 8, height: 8 }
+      const failed = { phase: 'error' as const, message: 'No.' }
+      // A copy that says loading while no read runs for it was left behind by a read that died.
+      const leftBehind = { phase: 'loading' as const }
+
+      expect(needsThumb(undefined, false)).toBe(true)
+
+      for (const copy of [ready, failed, leftBehind]) {
+        expect(needsThumb(copy, false)).toBe(false)
+      }
+
+      for (const copy of [undefined, ready, failed, leftBehind]) {
+        expect(needsThumb(copy, true)).toBe(true)
+      }
+    })
+
+    test('does not let an older read of a report write over a newer one while the copy of its screenshot starts', async ($, on) => {
+      let isRead = false
+      let isHeld = false
+      let count = 0
+      const seen = world(on, {
+        surfaces: ['desktop'],
+        check: allowReads('Tuix'),
+        // The older read asks for the verdict on get_screenshot, alone and after the read of the report, to start the
+        // copy, before it writes its report. The verdict sleeps on the mock clock, so that a newer read can begin and end
+        // while the older one waits.
+        whileChecking: async tool => {
+          if (tool.endsWith('__get_screenshot') && isRead && !isHeld && seen.checks.at(-2) !== 'mcp__Tuix__get_issue') {
+            isHeld = true
+            await seen.clock.sleep(60_000)
+          }
+        },
+        // The first read answers a title that the second does not.
+        report: args => {
+          const answer = reportOf('i9', args)
+
+          isRead = true
+          count += 1
+
+          return count === 1 ? { ...answer, issue: { ...(answer.issue as Record<string, unknown>), title: 'Title of the older read' } } : answer
+        },
+      })
+
+      await tuix($, 'list')
+
+      const ui = await pane($, 'desktop')
+
+      await ui.press({ key: 'issue-i9' })
+      await seen.clock.advance(1)
+      await ui.press({ key: 'reload' })
+      await seen.clock.advance(1)
+      await ui.redraw()
+
+      expect(reads(seen)).toHaveLength(2)
+      expect(isHeld).toBe(true)
+      expect(await text(ui, 'Pay button does nothing')).toBeDefined()
+      expect(await text(ui, 'Title of the older read')).toBeUndefined()
+
+      // The older read gets its verdict now. Its report is not the newest, so it is not written over the newer one.
+      await seen.clock.advance(60_000)
+      await ui.redraw()
+
+      expect(reads(seen)).toHaveLength(2)
+      expect(await text(ui, 'Pay button does nothing')).toBeDefined()
+      expect(await text(ui, 'Title of the older read')).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test('reads nothing from a rule that does not allow it, and from a deny rule, on its own', async ($, on) => {
+      const seen = world(on, {
+        surfaces: ['desktop'],
+        check: tool => (tool.endsWith('__get_screenshot') ? { decision: 'deny', rule: 'mcp__Tuix__get_screenshot' } : allowReads('Tuix')(tool)),
+      })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      expect(shotCalls(seen)).toHaveLength(0)
+      expect(await ui.find({ key: 'thumb-show' })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('reads the screenshot where Claude Code has made it a JPEG', async ($, on) => {
+      const seen = world(on, {
+        surfaces: ['desktop'],
+        check: allowReads('Tuix'),
+        shot: args => shotAnswer(args, { media_type: 'image/jpeg', data: UI_JPEG }),
+      })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      expect(await picture(ui)).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('reads the screenshot where the server answers a plain MCP image block', async ($, on) => {
+      const seen = world(on, {
+        surfaces: ['desktop'],
+        check: allowReads('Tuix'),
+        shot: args => ({
+          content: [{ type: 'image', data: ALPHA_PNG, mimeType: 'image/png' }, { type: 'text', text: JSON.stringify({ issue_id: args.issue_id }) }],
+          isError: false,
+        }),
+      })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      expect(await picture(ui)).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('reads the screenshot of the report: the first original, else the first one', () => {
+      const shot = (id: string, kind: 'original' | 'review' | 'other') => ({ id, kind, width: null, height: null, bytes: null, at: '' })
+
+      expect(pictureShot(null)).toBeUndefined()
+      expect(pictureShot([])).toBeUndefined()
+      expect(pictureShot([shot('a', 'review'), shot('b', 'original'), shot('c', 'original')])?.id).toBe('b')
+      expect(pictureShot([shot('a', 'review'), shot('b', 'other')])?.id).toBe('a')
+    })
+
+    for (const surface of ['terminal'] as const) {
+      test(`draws no screenshot and reads none on ${surface}`, async ($, on) => {
+        const seen = world(on, { surfaces: [surface], check: allowReads('Tuix') })
+        const ui = await open($, seen, surface)
+
+        await settle(seen)
+
+        expect(shotCalls(seen)).toHaveLength(0)
+        expect(await heading(ui, 'Screenshot')).toBeUndefined()
+        expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+        expect(await heading(ui, 'Where')).toBeDefined()
+        expect(await ui.find({ key: 'shot-s1' })).toBeDefined()
+        await ui.unmount()
+      })
+    }
+
+    test('reads nothing for a report that has no screenshot, and keeps the locator', async ($, on) => {
+      const seen = world(on, {
+        surfaces: ['desktop'],
+        check: allowReads('Tuix'),
+        report: args => reportOf('i9', args, { ...CONTEXT, screenshots: [] }),
+      })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      expect(shotCalls(seen)).toHaveLength(0)
+      expect(await heading(ui, 'Screenshot')).toBeUndefined()
+      expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+      expect(await locator(ui)).toBeDefined()
+      await ui.unmount()
+    })
+
+    const garbage = Array.from({ length: 64 }, (_, i) => String.fromCharCode(65 + (i % 26))).join('')
+    const fails = [
+      ['the server refuses it', () => refusal('This connection has no screenshots.'), 'Tuix: This connection has no screenshots.'],
+      [
+        'the server leaves the image out because it is large',
+        (args: Record<string, unknown>): McpToolResult => ({
+          content: [{ type: 'text', text: JSON.stringify({ issue_id: args.issue_id, image_omitted: 'The PNG is too large to attach as an image (over 3.7 MB); screenshot.url serves it for a few minutes instead.' }) }],
+          isError: false,
+        }),
+        'The screenshot is too large to show here. Open screenshot has the full size.',
+      ],
+      ['the server sends no image at all', () => reply({ ok: true }), 'Tuix sent no image.'],
+      ['the image is a GIF', (args: Record<string, unknown>) => shotAnswer(args, { media_type: 'image/gif', data: UI_PNG }), 'Only a PNG or a JPEG screenshot can be shown.'],
+      ['the PNG is not one', (args: Record<string, unknown>) => shotAnswer(args, { media_type: 'image/png', data: garbage }), 'The screenshot is not a PNG.'],
+      ['the answer is too large for Claude Code to pass on', () => tooLarge(), 'Tuix: the answer was too large for Claude Code to pass to the mod.'],
+    ] as const
+
+    for (const [label, answer, words] of fails) {
+      test(`says so in one dim line and keeps the locator when ${label}`, async ($, on) => {
+        const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix'), shot: args => answer(args) })
+        const ui = await open($, seen, 'desktop')
+
+        await settle(seen)
+
+        const line = await text(ui, words)
+
+        expect(shotCalls(seen)).toHaveLength(1)
+        expect(line).toBeDefined()
+        expect(line?.props.dimColor).toBe(true)
+        expect(await picture(ui)).toBeUndefined()
+        expect(await locator(ui)).toBeDefined()
+        expect(await ui.find({ key: 'thumb-show' })).toBeUndefined()
+        // The row of the screenshot is in the list, with Open screenshot, as before.
+        expect(await heading(ui, 'Screenshots')).toBeDefined()
+        expect(await ui.find({ key: 'shot-s1' })).toBeDefined()
+        // A failed read is not read again by itself, nor when the pane draws again; Reload reads it once more.
+        await ui.redraw()
+        expect(shotCalls(seen)).toHaveLength(1)
+        await ui.press({ key: 'reload' })
+        await settle(seen)
+        expect(shotCalls(seen)).toHaveLength(2)
+        await ui.unmount()
+      })
+    }
+
+    test('gives the Setup state when Claude Code does not let the mod read the screenshot, and reads again on Try again', async ($, on) => {
+      const refusedTools = ['get_screenshot']
+      const seen = world(on, { surfaces: ['desktop'], refusedTools })
+      const ui = await open($, seen, 'desktop')
+
+      await ui.press({ key: 'thumb-show' })
+      await settle(seen)
+
+      expect(await text(ui, 'Claude Code did not let the mod read Tuix')).toBeDefined()
+      expect(JSON.stringify(await ui.find({ key: 'rule-1' }))).toContain('mcp__Tuix__get_*')
+      // The report stays, and so does the locator.
+      expect(await heading(ui, 'Element')).toBeDefined()
+      expect(await locator(ui)).toBeDefined()
+
+      refusedTools.length = 0
+      await ui.press({ key: 'retry' })
+      await settle(seen)
+
+      expect(await ui.find({ key: 'rule-0' })).toBeUndefined()
+      expect(await picture(ui)).toBeDefined()
+      expect(await locator(ui)).toBeUndefined()
+      expect(shotCalls(seen)).toHaveLength(2)
+      await ui.unmount()
+    })
+
+    test('draws no word of the report in the picture, only the word Screenshot and the base64', async ($, on) => {
+      const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix') })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      const source = String((await picture(ui))?.props.source)
+      const bare = source.replace(/base64,[A-Za-z0-9+/=]+/, 'base64,')
+      const words = [...wordsOf(CONTEXT), ...wordsOf(ISSUES), ...wordsOf(COMMENTS)]
+
+      for (const word of words) {
+        expect(bare).not.toContain(word)
+      }
+
+      expect(bare).toContain('>Screenshot</text>')
+      await ui.unmount()
+    })
+
+    test('keeps the tree under the limit of the drawing with a copy in it', async ($, on) => {
+      const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix') })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+
+      // The limit is on the text of the Text and Code elements; an Svg has its own, 131,072 characters.
+      const texts = stringsOf(await ui.drawn()).filter(one => !one.where.startsWith('Svg'))
+
+      expect(texts.reduce((sum, one) => sum + one.value.length, 0)).toBeLessThan(100_000)
+      expect(Math.max(...(await ui.findAll({ type: 'Svg' })).map(one => String(one.props.source).length))).toBeLessThan(131_072)
+      await ui.unmount()
+    })
+
+    test('opens the full-size screenshot from the button under the picture', async ($, on) => {
+      const seen = world(on, { surfaces: ['desktop'], check: allowReads('Tuix') })
+      const ui = await open($, seen, 'desktop')
+
+      await settle(seen)
+      await ui.press({ key: 'shot-s1' })
+      await seen.clock.advance(1)
+
+      expect(reads(seen).at(-1)?.args).toEqual({ id: 'i9', limit: 1, include: ['screenshots'] })
+      expect((await ui.findAll({ type: 'Link' })).map(one => one.props.href)).toContain(SHOT_URL)
+      expect(await picture(ui)).toBeDefined()
+      await ui.unmount()
+    })
+
+    test('keeps at most four small copies, the newest ones, and no more than forty entries of any kind', () => {
+      const ready = (n: number) => ({ phase: 'ready' as const, source: `<svg>${n}</svg>`, width: 8, height: 8 })
+      let all: Record<string, ReturnType<typeof ready> | { phase: 'loading' } | { phase: 'error'; message: string }> = {}
+
+      for (let n = 1; n <= 6; n += 1) all = rememberThumb(all, `s${n}`, ready(n))
+
+      expect(MAX_THUMBS).toBe(4)
+      expect(Object.keys(all)).toEqual(['s3', 's4', 's5', 's6'])
+
+      // Entries that are not ready do not count among the four, and a ready one that is read again is the newest.
+      all = rememberThumb(all, 'l1', { phase: 'loading' })
+      all = rememberThumb(all, 'e1', { phase: 'error', message: 'No.' })
+      all = rememberThumb(all, 's3', ready(33))
+      all = rememberThumb(all, 's7', ready(7))
+
+      expect(Object.keys(all)).toEqual(['s5', 's6', 'l1', 'e1', 's3', 's7'])
+
+      for (let n = 0; n < 60; n += 1) all = rememberThumb(all, `e${n}`, { phase: 'error', message: 'No.' })
+
+      expect(Object.keys(all).length).toBeLessThanOrEqual(40)
     })
   })
 
@@ -2903,9 +3962,11 @@ describe('the report of an issue', () => {
           expect(JSON.stringify(node.props)).not.toContain(MARK)
           expect(String(node.props?.source)).not.toMatch(/<(?:script|image|foreignObject)|onload|javascript|alert/i)
 
-          // The badge has the fixed labels of Tuix in text. The locator has no text at all.
+          // The chips, the headings and the meta line have the fixed words of Tuix in text. The locator has no text at all.
           if (node.props?.alt === LOCATOR_ALT) {
             expect(String(node.props.source)).not.toContain('<text')
+          } else {
+            expect(isFixedWords(wordsDrawn(String(node.props?.source)))).toBe(true)
           }
         }
 
@@ -2930,6 +3991,43 @@ describe('the report of an issue', () => {
           expect(sent).not.toContain(MARK)
         }
 
+        await ui.unmount()
+      })
+    }
+
+    // The list with Details, on an engine that has no Button that holds Text, and with the title as the press, on one that has.
+    for (const [base, isTitleButton] of [['2.1.286', false], ['2.1.296', true]] as const) {
+      test(`draws the words of a hostile list in Text only, and its pictures hold fixed words, on an engine of ${base}`, async ($, on) => {
+        world(on, { list: () => ({ issues: [evilIssue], next_cursor: null }), base })
+
+        if (isTitleButton && !(await drawsTextButtons($, on))) return
+
+        await begin($)
+        await tuix($, 'list')
+        const ui = await pane($, 'desktop')
+        const tree = await ui.drawn()
+        const marked = stringsOf(tree).filter(one => one.value.includes(MARK))
+
+        expect(marked.length).toBeGreaterThan(1)
+
+        // The title is a Text. When it is the press, the engine names the button by it too.
+        for (const one of marked) {
+          expect(isTitleButton ? ['Text', 'Button.label'] : ['Text']).toContain(one.where)
+        }
+
+        for (const node of elementsOf(tree)) {
+          if (node.type === 'Svg') {
+            expect(JSON.stringify(node.props)).not.toContain(MARK)
+            expect(isFixedWords(wordsDrawn(String(node.props?.source)))).toBe(true)
+          }
+
+          if (node.type === 'Link' || node.type === 'Markdown') {
+            expect(JSON.stringify(node.props)).not.toContain(MARK)
+          }
+        }
+
+        expect(elementsOf(tree).filter(one => one.type === 'Markdown')).toEqual([])
+        expect((await ui.findAll({ type: 'Link' })).map(one => one.props.label)).toEqual([])
         await ui.unmount()
       })
     }
@@ -3003,14 +4101,14 @@ describe('the report of an issue', () => {
         // or line breaks (2 characters each), so the sum of the text is the measure.
         const words = async () => stringsOf(await ui.drawn()).reduce((sum, one) => sum + one.value.length, 0)
 
-        expect(await text(ui, 'Comments (20+)')).toBeDefined()
+        expect(await heading(ui, 'Comments (20+)')).toBeDefined()
         expect(await words()).toBeLessThan(100_000)
 
         // Load more comments up to the most the pane holds.
         await ui.press({ key: 'comments-more' })
         await seen.clock.advance(1)
 
-        expect(await text(ui, 'Comments (40+)')).toBeDefined()
+        expect(await heading(ui, 'Comments (40+)')).toBeDefined()
         expect(await words()).toBeLessThan(100_000)
         expect((await ui.findAll({ type: 'Button' })).filter(one => String(one.key).startsWith('shot-'))).toHaveLength(LIMITS.screenshots)
         await ui.unmount()
